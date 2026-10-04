@@ -19,6 +19,7 @@ message ClientHello {
   bytes client_ephemeral_pubkey = 4; // 32 bytes X25519
   bytes client_identity_pubkey = 5;  // 32 bytes Ed25519 (long-term identity)
   bytes auth_token = 6;              // optional PSK/token
+  int64 client_time = 7;             // Unix nanoseconds, for clock offset estimation
 }
 
 // Server -> Client (plaintext). Server's ephemeral key and selected suite.
@@ -28,6 +29,7 @@ message ServerHello {
   bytes server_random = 3;            // 32 bytes high-entropy
   bytes server_ephemeral_pubkey = 4;  // 32 bytes X25519
   bytes server_identity_pubkey = 5;   // 32 bytes Ed25519
+  int64 server_time = 6;              // Unix nanoseconds, for clock offset estimation
 }
 
 // Server -> Client (plaintext). Signature binds the handshake transcript.

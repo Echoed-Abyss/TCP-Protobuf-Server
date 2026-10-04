@@ -62,6 +62,14 @@ type Conn struct {
 	// trust store for TOFU / pinned peer identity verification.
 	trustStore     *trust.Store
 	peerIdentifier string // label used in the trust store (e.g. dial address)
+
+	// renegotiation state (PFS full re-handshake).
+	renegMu sync.Mutex
+	reneg   *renegotiation
+
+	// clockOffset is the estimated clock offset relative to the peer,
+	// applied to timestamp validation. Nanoseconds.
+	clockOffset int64
 }
 
 // NewConn wraps an existing net.Conn. The identity key is used for
@@ -189,6 +197,8 @@ func aadFor(f *protocol.Frame, sessionID []byte) []byte {
 }
 
 // writeEncrypted encrypts the given message type + payload and sends it.
+// The plaintext is padded (length-prefixed, block-aligned) before encryption
+// so that ciphertext length does not reveal plaintext length.
 func (c *Conn) writeEncrypted(msgType protocol.MsgType, payload []byte) error {
 	sess := c.getSession()
 	if sess == nil {
@@ -201,7 +211,8 @@ func (c *Conn) writeEncrypted(msgType protocol.MsgType, payload []byte) error {
 	f := protocol.NewFrame(msgType, sess.KeyID(), seq, nil, nil)
 	aad := aadFor(f, sess.SessionID())
 
-	ciphertext := sess.Encrypt(seq, payload, aad)
+	padded := protocol.PadWithPrefix(payload, protocol.PaddingBlockSize)
+	ciphertext := sess.Encrypt(seq, padded, aad)
 	f.Payload = ciphertext
 	// Populate the nonce field with the deterministic nonce for explicitness.
 	copy(f.Nonce[:], deriveNonceBytes(seq))
@@ -259,14 +270,33 @@ func randomBytes(n int) []byte {
 }
 
 // checkTimeWindow verifies the frame timestamp is within the allowed skew.
-func checkTimeWindow(f *protocol.Frame, maxSkew time.Duration) bool {
+// It applies the estimated clock offset so that peer timestamps are compared
+// in local time. The offset is bounded by MaxClockOffset; frames from peers
+// with excessive skew are rejected.
+func (c *Conn) checkTimeWindow(f *protocol.Frame, maxSkew time.Duration) bool {
 	now := time.Now().UnixNano()
-	ts := int64(f.Timestamp)
+	ts := int64(f.Timestamp) - c.clockOffset
 	diff := now - ts
 	if diff < 0 {
 		diff = -diff
 	}
 	return diff <= maxSkew.Nanoseconds()
+}
+
+// estimateClockOffset computes the estimated offset between the local clock
+// and the peer's clock from a signed peer timestamp. offset = peerTime - now.
+// Offsets exceeding MaxClockOffset are rejected (fail-closed) to prevent
+// abuse of the compensation mechanism.
+func (c *Conn) estimateClockOffset(peerTime int64) {
+	offset := peerTime - time.Now().UnixNano()
+	if offset < 0 {
+		if -offset > protocol.MaxClockOffset {
+			offset = 0 // too large; disable compensation rather than accept
+		}
+	} else if offset > protocol.MaxClockOffset {
+		offset = 0
+	}
+	c.clockOffset = offset
 }
 
 // ErrNotReady is returned when the connection hasn't completed the handshake.

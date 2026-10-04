@@ -28,8 +28,9 @@ var ErrPeerKeyMismatch = errors.New("peer identity key mismatch (possible MITM o
 type Store struct {
 	mu       sync.Mutex
 	path     string
-	entries  map[string]string // identifier -> hex(public key)
-	pinned   map[string]string // identifier -> hex(public key), takes precedence (from config)
+	entries  map[string]string   // identifier -> hex(public key)
+	pinned   map[string][]string // identifier -> []hex(public key) (pin list)
+	revoked  map[string]bool     // hex(public key) -> revoked (CRL)
 }
 
 // NewStore loads a trust store from path. If the file does not exist, an
@@ -38,7 +39,8 @@ func NewStore(path string) (*Store, error) {
 	s := &Store{
 		path:    path,
 		entries: make(map[string]string),
-		pinned:  make(map[string]string),
+		pinned:  make(map[string][]string),
+		revoked: make(map[string]bool),
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -48,16 +50,54 @@ func NewStore(path string) (*Store, error) {
 
 // SetPinned registers a compile-time/configuration-pinned key for an
 // identifier. Pinned keys take precedence over TOFU entries and are never
-// overwritten.
+// overwritten. Replaces any existing pinned keys for this identifier.
 func (s *Store) SetPinned(identifier string, pubKey []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pinned[identifier] = hex.EncodeToString(pubKey)
+	s.pinned[identifier] = []string{hex.EncodeToString(pubKey)}
+}
+
+// SetPinnedList registers multiple pinned keys for an identifier (smooth
+// key rotation: both old and new keys are accepted during transition).
+func (s *Store) SetPinnedList(identifier string, pubKeys [][]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list := make([]string, 0, len(pubKeys))
+	for _, k := range pubKeys {
+		list = append(list, hex.EncodeToString(k))
+	}
+	s.pinned[identifier] = list
+}
+
+// Revoke adds a public key to the revocation list (CRL). Any connection
+// presenting this key is rejected regardless of pinning or TOFU status.
+func (s *Store) Revoke(pubKey []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.revoked[hex.EncodeToString(pubKey)] = true
+}
+
+// RevokeList adds multiple public keys to the revocation list.
+func (s *Store) RevokeList(pubKeys [][]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, k := range pubKeys {
+		s.revoked[hex.EncodeToString(k)] = true
+	}
+}
+
+// IsRevoked returns true if the public key is in the revocation list.
+func (s *Store) IsRevoked(pubKey []byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revoked[hex.EncodeToString(pubKey)]
 }
 
 // VerifyOrTrust checks whether pubKey matches the stored key for identifier.
 //
-//   - If a pinned key is set, pubKey MUST match it (no automatic trust).
+//   - If pubKey is in the CRL, it is always rejected.
+//   - If a pinned key list is set, pubKey MUST match one of them (no
+//     automatic trust).
 //   - If no entry exists, the key is trusted and saved (TOFU).
 //   - If an entry exists, pubKey MUST match it.
 //
@@ -68,13 +108,26 @@ func (s *Store) VerifyOrTrust(identifier string, pubKey []byte) error {
 
 	hexKey := hex.EncodeToString(pubKey)
 
-	// Pinned key always wins.
-	if pinned, ok := s.pinned[identifier]; ok {
-		if pinned != hexKey {
-			return fmt.Errorf("%w: identifier=%s expected=%s got=%s",
-				ErrPeerKeyMismatch, identifier, pinned, hexKey)
+	// CRL check first: revoked keys are never accepted.
+	if s.revoked[hexKey] {
+		return fmt.Errorf("%w: key %s is revoked", ErrPeerKeyMismatch, hexKey)
+	}
+
+	// Pinned key list always wins. Check the specific identifier first,
+	// then the global "*" catch-all (used when the same pin set applies
+	// to all peers, e.g. a server pinning a set of allowed client keys).
+	pinned := s.pinned[identifier]
+	if len(pinned) == 0 {
+		pinned = s.pinned["*"]
+	}
+	if len(pinned) > 0 {
+		for _, p := range pinned {
+			if p == hexKey {
+				return nil
+			}
 		}
-		return nil
+		return fmt.Errorf("%w: identifier=%s not in pinned list",
+			ErrPeerKeyMismatch, identifier)
 	}
 
 	existing, ok := s.entries[identifier]

@@ -24,8 +24,23 @@ const (
 	MsgTypeServerFinished   MsgType = 5
 	MsgTypeData             MsgType = 6
 	MsgTypeHeartbeat        MsgType = 7
-	MsgTypeRekey            MsgType = 8
+	MsgTypeRekey            MsgType = 8 // in-band rekey (non-PFS, HKDF from old TS)
 	MsgTypeAlert            MsgType = 9
+
+	// Renegotiation message types (full re-handshake for PFS).
+	// These are sent ENCRYPTED under the current session key. They carry
+	// fresh X25519 ephemeral keys so the new session provides forward
+	// secrecy: compromise of the old session key does not reveal the new
+	// session key (which is derived from a fresh DH exchange).
+	MsgTypeRenegClientHello    MsgType = 10
+	MsgTypeRenegServerHello    MsgType = 11
+	MsgTypeRenegServerProof    MsgType = 12
+	MsgTypeRenegClientFinished MsgType = 13
+	MsgTypeRenegServerFinished MsgType = 14
+
+	// Dummy / cover traffic frame. Payload is random padding; ignored by
+	// the receiver. Used to obfuscate traffic timing and message sizes.
+	MsgTypeDummy MsgType = 15
 )
 
 // Cipher suites negotiated in the handshake.
@@ -85,3 +100,33 @@ const MaxKeyID uint8 = 250
 // but key_id has reached MaxKeyID. The caller must perform a full
 // renegotiation (close and re-handshake) instead.
 var ErrRekeyOverflow = errors.New("key id exhausted; full renegotiation required")
+
+// PaddingBlockSize is the block size to which payloads are padded.
+// Padding is applied BEFORE encryption so the ciphertext length does not
+// reveal the plaintext length. Padding bytes are zero (the receiver strips
+// them after decryption using the declared plaintext length embedded in the
+// payload prefix). Default 16 bytes; set to 0 to disable.
+const PaddingBlockSize = 16
+
+// MaxPaddingSize caps the total padding overhead per frame.
+const MaxPaddingSize = 1024
+
+// DummyFrameInterval is the base interval between dummy/cover frames.
+// A random jitter of ±DummyFrameJitter is applied so the timing does not
+// form a detectable pattern. 0 disables dummy frames.
+const DummyFrameInterval int64 = 10 * 1e9 // 10 seconds
+
+// DummyFrameJitter is the maximum random jitter added to/subtracted from
+// DummyFrameInterval.
+const DummyFrameJitter int64 = 3 * 1e9 // ±3 seconds
+
+// DefaultDummyPayloadSize is the payload size of dummy frames.
+const DefaultDummyPayloadSize = 64
+
+// MaxClockOffset is the maximum allowed estimated clock offset that the
+// client will compensate for. Offsets beyond this are treated as errors.
+const MaxClockOffset int64 = 5 * 60 * 1e9 // 5 minutes
+
+// ForceRenegotiateInterval is the default interval after which a full
+// re-handshake is triggered to restore forward secrecy.
+const ForceRenegotiateInterval int64 = 3600 * 1e9 // 1 hour

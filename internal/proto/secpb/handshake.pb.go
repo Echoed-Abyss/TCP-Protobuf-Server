@@ -80,6 +80,7 @@ type ClientHello struct {
 	ClientEphemeralPubkey []byte                 `protobuf:"bytes,4,opt,name=client_ephemeral_pubkey,json=clientEphemeralPubkey,proto3" json:"client_ephemeral_pubkey,omitempty"` // 32 bytes X25519
 	ClientIdentityPubkey  []byte                 `protobuf:"bytes,5,opt,name=client_identity_pubkey,json=clientIdentityPubkey,proto3" json:"client_identity_pubkey,omitempty"`    // 32 bytes Ed25519 (long-term identity)
 	AuthToken             []byte                 `protobuf:"bytes,6,opt,name=auth_token,json=authToken,proto3" json:"auth_token,omitempty"`                                       // optional PSK/token
+	ClientTime            int64                  `protobuf:"varint,7,opt,name=client_time,json=clientTime,proto3" json:"client_time,omitempty"`                                   // Unix nanoseconds, for clock offset estimation
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -156,6 +157,13 @@ func (x *ClientHello) GetAuthToken() []byte {
 	return nil
 }
 
+func (x *ClientHello) GetClientTime() int64 {
+	if x != nil {
+		return x.ClientTime
+	}
+	return 0
+}
+
 // Server -> Client (plaintext). Server's ephemeral key and selected suite.
 type ServerHello struct {
 	state                 protoimpl.MessageState `protogen:"open.v1"`
@@ -164,6 +172,7 @@ type ServerHello struct {
 	ServerRandom          []byte                 `protobuf:"bytes,3,opt,name=server_random,json=serverRandom,proto3" json:"server_random,omitempty"`                              // 32 bytes high-entropy
 	ServerEphemeralPubkey []byte                 `protobuf:"bytes,4,opt,name=server_ephemeral_pubkey,json=serverEphemeralPubkey,proto3" json:"server_ephemeral_pubkey,omitempty"` // 32 bytes X25519
 	ServerIdentityPubkey  []byte                 `protobuf:"bytes,5,opt,name=server_identity_pubkey,json=serverIdentityPubkey,proto3" json:"server_identity_pubkey,omitempty"`    // 32 bytes Ed25519
+	ServerTime            int64                  `protobuf:"varint,6,opt,name=server_time,json=serverTime,proto3" json:"server_time,omitempty"`                                   // Unix nanoseconds, for clock offset estimation
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -231,6 +240,13 @@ func (x *ServerHello) GetServerIdentityPubkey() []byte {
 		return x.ServerIdentityPubkey
 	}
 	return nil
+}
+
+func (x *ServerHello) GetServerTime() int64 {
+	if x != nil {
+		return x.ServerTime
+	}
+	return 0
 }
 
 // Server -> Client (plaintext). Signature binds the handshake transcript.
@@ -478,7 +494,7 @@ var File_proto_handshake_proto protoreflect.FileDescriptor
 
 const file_proto_handshake_proto_rawDesc = "" +
 	"\n" +
-	"\x15proto/handshake.proto\x12\vsecproto.v1\"\x98\x02\n" +
+	"\x15proto/handshake.proto\x12\vsecproto.v1\"\xb9\x02\n" +
 	"\vClientHello\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x12=\n" +
 	"\rcipher_suites\x18\x02 \x03(\x0e2\x18.secproto.v1.CipherSuiteR\fcipherSuites\x12#\n" +
@@ -486,13 +502,17 @@ const file_proto_handshake_proto_rawDesc = "" +
 	"\x17client_ephemeral_pubkey\x18\x04 \x01(\fR\x15clientEphemeralPubkey\x124\n" +
 	"\x16client_identity_pubkey\x18\x05 \x01(\fR\x14clientIdentityPubkey\x12\x1d\n" +
 	"\n" +
-	"auth_token\x18\x06 \x01(\fR\tauthToken\"\xf7\x01\n" +
+	"auth_token\x18\x06 \x01(\fR\tauthToken\x12\x1f\n" +
+	"\vclient_time\x18\a \x01(\x03R\n" +
+	"clientTime\"\x98\x02\n" +
 	"\vServerHello\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x12;\n" +
 	"\fcipher_suite\x18\x02 \x01(\x0e2\x18.secproto.v1.CipherSuiteR\vcipherSuite\x12#\n" +
 	"\rserver_random\x18\x03 \x01(\fR\fserverRandom\x126\n" +
 	"\x17server_ephemeral_pubkey\x18\x04 \x01(\fR\x15serverEphemeralPubkey\x124\n" +
-	"\x16server_identity_pubkey\x18\x05 \x01(\fR\x14serverIdentityPubkey\"+\n" +
+	"\x16server_identity_pubkey\x18\x05 \x01(\fR\x14serverIdentityPubkey\x12\x1f\n" +
+	"\vserver_time\x18\x06 \x01(\x03R\n" +
+	"serverTime\"+\n" +
 	"\vServerProof\x12\x1c\n" +
 	"\tsignature\x18\x01 \x01(\fR\tsignature\".\n" +
 	"\x0eClientFinished\x12\x1c\n" +

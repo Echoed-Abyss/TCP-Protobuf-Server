@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/client"
@@ -24,8 +25,11 @@ type Config struct {
 	Role          string
 	Addr          string
 	KeyFile       string
-	PeerPubHex    string
+	PeerPubHex    string // comma-separated peer Ed25519 pubkeys (hex) for pinning
 	TrustStore    string // path to TOFU trust store file
+	RevokeHex     string // comma-separated revoked pubkeys (hex) for CRL
+	Passphrase    string // from -passphrase flag (insecure; prefer env/file)
+	PassphraseEnv string // from SECPROTO_PASSPHRASE
 	SessionTTL    time.Duration
 	HeartbeatInt  time.Duration
 	TimestampWin  time.Duration
@@ -39,7 +43,11 @@ func main() {
 		if cfg.KeyFile == "" {
 			fatal("genkey requires -key <path> (or SECPROTO_KEY)")
 		}
-		if err := generateKey(cfg.KeyFile); err != nil {
+		pass := cfg.resolvePassphrase()
+		if len(pass) == 0 {
+			fmt.Fprintln(os.Stderr, "warning: empty passphrase; key will be stored unencrypted (legacy format)")
+		}
+		if err := generateKey(cfg.KeyFile, pass); err != nil {
 			fatal("genkey failed: %v", err)
 		}
 		return
@@ -70,10 +78,23 @@ func loadConfig() *Config {
 	flag.StringVar(&cfg.Role, "role", envOr("SECPROTO_ROLE", ""), "server | client | genkey")
 	flag.StringVar(&cfg.Addr, "addr", cfg.Addr, "listen/dial address")
 	flag.StringVar(&cfg.KeyFile, "key", envOr("SECPROTO_KEY", ""), "path to identity key file (32-byte Ed25519 seed)")
-	flag.StringVar(&cfg.PeerPubHex, "peer-pub", envOr("SECPROTO_PEER_PUB", ""), "peer Ed25519 public key (hex) for pinning")
+	flag.StringVar(&cfg.PeerPubHex, "peer-pub", envOr("SECPROTO_PEER_PUB", ""), "comma-separated peer Ed25519 public keys (hex) for pinning")
+	flag.StringVar(&cfg.RevokeHex, "revoke", envOr("SECPROTO_REVOKE", ""), "comma-separated revoked public keys (hex) for CRL")
 	flag.StringVar(&cfg.TrustStore, "trust-store", envOr("SECPROTO_TRUST_STORE", ""), "path to TOFU trust store file")
+	flag.StringVar(&cfg.Passphrase, "passphrase", "", "identity key passphrase (insecure; prefer SECPROTO_PASSPHRASE)")
+	cfg.PassphraseEnv = os.Getenv("SECPROTO_PASSPHRASE")
 	flag.Parse()
 	return cfg
+}
+
+// resolvePassphrase returns the passphrase from the most secure available
+// source. Precedence: env var > flag. Returns empty string if neither is set
+// (caller decides whether to allow legacy unencrypted keys).
+func (c *Config) resolvePassphrase() string {
+	if c.PassphraseEnv != "" {
+		return c.PassphraseEnv
+	}
+	return c.Passphrase
 }
 
 func envOr(key, def string) string {
@@ -81,6 +102,26 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseHexList splits a comma-separated list of hex strings and decodes each.
+func parseHexList(s string) ([][]byte, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var out [][]byte
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		b, err := hex.DecodeString(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid hex %q: %w", part, err)
+		}
+		out = append(out, b)
+	}
+	return out, nil
 }
 
 // selfCheck validates prerequisites before starting. It never prints key
@@ -108,24 +149,51 @@ func selfCheck(cfg *Config) error {
 	return nil
 }
 
-func generateKey(path string) error {
+func generateKey(path string, passphrase string) error {
 	id, err := crypto.GenerateIdentity()
 	if err != nil {
 		return err
 	}
 	seed := id.Private.Seed()
-	if err := os.WriteFile(path, seed, 0600); err != nil {
+
+	var data []byte
+	if len(passphrase) > 0 {
+		data, err = crypto.EncryptSeed(seed, []byte(passphrase))
+		if err != nil {
+			return err
+		}
+	} else {
+		// Legacy unencrypted format (32-byte seed). Kept for backward
+		// compatibility; emit a warning.
+		data = seed
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
 		return err
 	}
-	fmt.Printf("wrote identity seed to %s (mode 0600)\n", path)
+	fmt.Printf("wrote identity key to %s (mode 0600)\n", path)
 	fmt.Printf("public key (hex): %s\n", hex.EncodeToString(id.Public))
 	return nil
 }
 
-func loadIdentity(path string) (*crypto.IdentityKey, error) {
-	seed, err := os.ReadFile(path)
+func loadIdentity(path string, passphrase string) (*crypto.IdentityKey, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
+	}
+
+	var seed []byte
+	if len(data) == ed25519.SeedSize {
+		// Legacy unencrypted seed file.
+		seed = data
+	} else {
+		// Passphrase-encrypted key file.
+		if len(passphrase) == 0 {
+			return nil, fmt.Errorf("key file %q is encrypted; provide passphrase via SECPROTO_PASSPHRASE or -passphrase", path)
+		}
+		seed, err = crypto.DecryptSeed(data, []byte(passphrase))
+		if err != nil {
+			return nil, fmt.Errorf("decrypt key file %q: %w", path, err)
+		}
 	}
 	if len(seed) != ed25519.SeedSize {
 		return nil, fmt.Errorf("invalid key file %q: expected %d bytes, got %d", path, ed25519.SeedSize, len(seed))
@@ -139,7 +207,7 @@ func runServer(cfg *Config) error {
 	if err := selfCheck(cfg); err != nil {
 		return err
 	}
-	id, err := loadIdentity(cfg.KeyFile)
+	id, err := loadIdentity(cfg.KeyFile, cfg.resolvePassphrase())
 	if err != nil {
 		return err
 	}
@@ -147,13 +215,38 @@ func runServer(cfg *Config) error {
 
 	srv := server.NewServer(id)
 
-	if cfg.TrustStore != "" {
+	// Configure trust: pinned peer keys (multi-pin) and CRL.
+	pinnedKeys, err := parseHexList(cfg.PeerPubHex)
+	if err != nil {
+		return fmt.Errorf("invalid -peer-pub: %w", err)
+	}
+	revokedKeys, err := parseHexList(cfg.RevokeHex)
+	if err != nil {
+		return fmt.Errorf("invalid -revoke: %w", err)
+	}
+	if len(pinnedKeys) > 0 || len(revokedKeys) > 0 || cfg.TrustStore != "" {
 		store, err := trust.NewStore(cfg.TrustStore)
 		if err != nil {
 			return fmt.Errorf("trust store: %w", err)
 		}
+		if len(pinnedKeys) > 0 {
+			// Use "*" as a catch-all identifier so any connecting peer
+			// must present one of the pinned keys.
+			store.SetPinnedList("*", pinnedKeys)
+		}
+		if len(revokedKeys) > 0 {
+			store.RevokeList(revokedKeys)
+		}
 		srv.SetTrustStore(store)
-		fmt.Printf("TOFU trust store: %s\n", cfg.TrustStore)
+		if cfg.TrustStore != "" {
+			fmt.Printf("TOFU trust store: %s\n", cfg.TrustStore)
+		}
+		if len(pinnedKeys) > 0 {
+			fmt.Printf("pinned peer keys: %d\n", len(pinnedKeys))
+		}
+		if len(revokedKeys) > 0 {
+			fmt.Printf("revoked keys (CRL): %d\n", len(revokedKeys))
+		}
 	}
 
 	srv.OnConn = func(c *transport.Conn) {
@@ -172,7 +265,7 @@ func runClient(cfg *Config) error {
 	if err := selfCheck(cfg); err != nil {
 		return err
 	}
-	id, err := loadIdentity(cfg.KeyFile)
+	id, err := loadIdentity(cfg.KeyFile, cfg.resolvePassphrase())
 	if err != nil {
 		return err
 	}

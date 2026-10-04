@@ -62,6 +62,7 @@ func (c *Conn) clientHandshake() error {
 		ClientRandom:          clientRandom,
 		ClientEphemeralPubkey: clientEph.Public[:],
 		ClientIdentityPubkey:  c.identity.Public,
+		ClientTime:            time.Now().UnixNano(),
 	}
 	chBytes, err := proto.Marshal(ch)
 	if err != nil {
@@ -86,6 +87,9 @@ func (c *Conn) clientHandshake() error {
 	if len(sh.ServerRandom) != 32 || len(sh.ServerEphemeralPubkey) != 32 {
 		return protocol.ErrHandshake
 	}
+
+	// Estimate clock offset from the server's signed timestamp.
+	c.estimateClockOffset(sh.ServerTime)
 
 	// Verify server identity: pinned key, TOFU store, or accept.
 	if err := c.verifyPeerTrust(sh.ServerIdentityPubkey); err != nil {
@@ -182,6 +186,9 @@ func (c *Conn) serverHandshake() error {
 		return protocol.ErrHandshake
 	}
 
+	// Estimate clock offset from the client's signed timestamp.
+	c.estimateClockOffset(ch.ClientTime)
+
 	// 2. Select cipher suite (prefer AES-256-GCM).
 	selected := selectCipherSuite(ch.CipherSuites)
 	if selected == protocol.CipherSuiteUnspecified {
@@ -209,6 +216,7 @@ func (c *Conn) serverHandshake() error {
 		ServerRandom:          serverRandom,
 		ServerEphemeralPubkey: serverEph.Public[:],
 		ServerIdentityPubkey:  c.identity.Public,
+		ServerTime:            time.Now().UnixNano(),
 	}
 	shBytes, err := proto.Marshal(sh)
 	if err != nil {
@@ -305,7 +313,7 @@ func (c *Conn) readPlaintext(expected protocol.MsgType) ([]byte, error) {
 	if f.MsgType != expected {
 		return nil, protocol.ErrHandshake
 	}
-	if !checkTimeWindow(f, time.Duration(protocol.HandshakeTimeWindow)) {
+	if !c.checkTimeWindow(f, time.Duration(protocol.HandshakeTimeWindow)) {
 		return nil, protocol.ErrExpired
 	}
 	return f.Payload, nil
@@ -333,13 +341,18 @@ func (c *Conn) readEncrypted() ([]byte, error) {
 		protocol.GlobalMetrics.ReplayRejected.Add(1)
 		return nil, protocol.ErrReplay
 	}
-	if !checkTimeWindow(f, time.Duration(protocol.DataTimeWindow)) {
+	if !c.checkTimeWindow(f, time.Duration(protocol.DataTimeWindow)) {
 		protocol.GlobalMetrics.ExpiredRejected.Add(1)
 		return nil, protocol.ErrExpired
 	}
 
 	aad := aadFor(f, sess.SessionID())
-	plaintext, err := sess.Decrypt(f.Seq, f.Payload, aad)
+	padded, err := sess.Decrypt(f.Seq, f.Payload, aad)
+	if err != nil {
+		protocol.GlobalMetrics.DecryptFailed.Add(1)
+		return nil, protocol.ErrDecryptFailed
+	}
+	plaintext, err := protocol.UnpadWithPrefix(padded)
 	if err != nil {
 		protocol.GlobalMetrics.DecryptFailed.Add(1)
 		return nil, protocol.ErrDecryptFailed

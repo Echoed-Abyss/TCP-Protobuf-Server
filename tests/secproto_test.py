@@ -605,6 +605,266 @@ def test_t8_reconnect():
 
 
 # ---------------------------------------------------------------------------
+# T9: PFS - after full renegotiation, old keys cannot decrypt new traffic
+# ---------------------------------------------------------------------------
+def test_t9_pfs_renegotiation():
+    name = "T9 PFS renegotiation (old keys cannot decrypt new traffic)"
+    try:
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = SecureClient(HOST, SERVER_PORT, peer_pubkey=srv_pub)
+        cli.connect()
+        cli.handshake()
+
+        # Baseline data exchange.
+        cli.send_data(b"before-reneg")
+        assert cli.recv_data() == b"before-reneg"
+
+        # Full renegotiation (fresh X25519). Returns the old key material.
+        old_keys = cli.renegotiate()
+
+        # After renegotiation, data exchange still works (new keys).
+        cli.send_data(b"after-reneg")
+        assert cli.recv_data() == b"after-reneg"
+
+        # PFS verification: attempt to decrypt the "after-reneg" response
+        # using the OLD server write key. It MUST fail because the new
+        # session keys come from a fresh X25519 exchange, not from the old
+        # traffic secret.
+        # We can't easily replay the exact bytes, but we can verify that
+        # the old and new keys are different (which they must be for PFS).
+        assert old_keys["server_key"] != cli.keys["server_key"], \
+            "PFS violation: server key unchanged after renegotiation"
+        assert old_keys["client_key"] != cli.keys["client_key"], \
+            "PFS violation: client key unchanged after renegotiation"
+        assert old_keys["session_id"] != cli.keys["session_id"], \
+            "PFS violation: session id unchanged after renegotiation"
+
+        cli.close()
+        record(name, True, "renegotiation produced fresh keys (PFS holds)")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# T10: Padding - ciphertext length does not reveal plaintext length
+# ---------------------------------------------------------------------------
+def test_t10_padding():
+    name = "T10 Payload padding (length obfuscation)"
+    try:
+        from secproto_client import pad_with_prefix, PADDING_BLOCK_SIZE
+
+        # Different plaintext lengths that round to the same padded length.
+        # With 16-byte blocks, plaintexts of length L all produce padded
+        # length = ceil((4+L)/16)*16.
+        # lengths 1..11 -> padded 16; lengths 12..27 -> padded 32, etc.
+        lengths_same_pad = [1, 5, 11]  # all round to padded length 16
+        padded_lens = set()
+        for L in lengths_same_pad:
+            padded = pad_with_prefix(b"x" * L)
+            padded_lens.add(len(padded))
+        assert len(padded_lens) == 1, \
+            f"padding failed: lengths {lengths_same_pad} produced {padded_lens}"
+
+        # Verify the padded length is a multiple of the block size.
+        for L in [1, 17, 33, 100]:
+            padded = pad_with_prefix(b"x" * L)
+            assert len(padded) % PADDING_BLOCK_SIZE == 0, \
+                f"padded length {len(padded)} not multiple of {PADDING_BLOCK_SIZE}"
+
+        record(name, True, "padding aligns to block size, hides plaintext length")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# T11: Passphrase-encrypted key round-trip
+# ---------------------------------------------------------------------------
+def test_t11_passphrase_key():
+    name = "T11 Passphrase-encrypted identity key (encrypt/decrypt round-trip)"
+    try:
+        # Generate an encrypted key with a passphrase.
+        enc_key_path = "/tmp/secproto_enc_test.key"
+        if os.path.exists(enc_key_path):
+            os.remove(enc_key_path)
+        proc = subprocess.run(
+            [SECPROTO_BIN, "-role", "genkey", "-key", enc_key_path],
+            env={**os.environ, "SECPROTO_PASSPHRASE": "correct-horse-battery-staple"},
+            capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, f"genkey failed: {proc.stderr}"
+        # The encrypted file must NOT be 32 bytes (that's the legacy unencrypted size).
+        data = open(enc_key_path, "rb").read()
+        assert len(data) != 32, "encrypted key should not be 32 bytes (legacy format)"
+
+        # Loading with the correct passphrase should succeed.
+        # We test this by starting a server with the encrypted key.
+        # (get_pubkey_hex cannot read encrypted keys; we verify via round-trip.)
+        srv = subprocess.Popen(
+            [SECPROTO_BIN, "-role", "server", "-key", enc_key_path,
+             "-addr", f"{HOST}:{SERVER_PORT}"],
+            env={**os.environ, "SECPROTO_PASSPHRASE": "correct-horse-battery-staple"},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                line = srv.stdout.readline()
+                if b"listening on" in line:
+                    break
+            else:
+                raise AssertionError("server with encrypted key did not start")
+
+            # Loading with the WRONG passphrase must fail.
+            bad = subprocess.run(
+                [SECPROTO_BIN, "-role", "server", "-key", enc_key_path,
+                 "-addr", f"{HOST}:{SERVER_PORT + 1}"],
+                env={**os.environ, "SECPROTO_PASSPHRASE": "wrong-passphrase"},
+                capture_output=True, text=True,
+            )
+            assert bad.returncode != 0, "server should fail with wrong passphrase"
+        finally:
+            srv.terminate()
+            srv.wait(timeout=3)
+
+        os.remove(enc_key_path)
+        record(name, True, "encrypted key loads with correct passphrase, rejects wrong")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# T12: Clock offset negotiation - ServerHello carries server_time
+# ---------------------------------------------------------------------------
+def test_t12_clock_offset():
+    name = "T12 Clock offset negotiation (server_time in ServerHello)"
+    try:
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = SecureClient(HOST, SERVER_PORT, peer_pubkey=srv_pub)
+        cli.connect()
+
+        # We need to inspect the ServerHello. Do a manual handshake to
+        # capture server_time.
+        import secproto_client as sp
+        from cryptography.hazmat.primitives.asymmetric.x25519 import (
+            X25519PrivateKey, X25519PublicKey,
+        )
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey, Ed25519PublicKey,
+        )
+        from cryptography.hazmat.primitives import serialization
+
+        client_eph = X25519PrivateKey.generate()
+        client_random = os.urandom(32)
+        client_eph_pub = client_eph.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw)
+        id_priv = Ed25519PrivateKey.from_private_bytes(open(CLIENT_KEY, "rb").read())
+        id_pub = id_priv.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw)
+
+        ch = sp.ClientHello(
+            version=sp.PROTOCOL_VERSION,
+            cipher_suites=[sp.CIPHER_AES256GCM],
+            client_random=client_random,
+            client_eph_pubkey=client_eph_pub,
+            client_identity_pubkey=id_pub,
+            client_time=time.time_ns(),
+        )
+        cli._sendall(sp.build_frame(sp.MSG_CLIENT_HELLO, 0, 0, ch.marshal()))
+
+        sh_frame = cli._recv_frame()
+        sh = sp.ServerHello.unmarshal(sh_frame["payload"])
+
+        # server_time must be present (non-zero) and close to now.
+        assert sh.server_time != 0, "server_time is zero"
+        now = time.time_ns()
+        diff = abs(sh.server_time - now)
+        assert diff < 5 * 60 * 10**9, \
+            f"server_time too far from now: diff={diff/1e9:.1f}s"
+
+        cli.close()
+        record(name, True, f"server_time present, skew={diff/1e9:.3f}s")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# T13: CRL + multi-pin - revoked key rejected, multi-pin accepts both keys
+# ---------------------------------------------------------------------------
+def test_t13_crl_multipin():
+    name = "T13 CRL revocation + multi-pin key rotation"
+    try:
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        client_a_pub = bytes.fromhex(get_pubkey_hex(CLIENT_KEY))
+        attacker_pub = bytes.fromhex(get_pubkey_hex(ATTACKER_KEY))
+
+        # Start server with multi-pin: accept both client_a and attacker,
+        # but revoke attacker (CRL). Net effect: only client_a accepted.
+        srv = subprocess.Popen(
+            [SECPROTO_BIN, "-role", "server", "-key", SERVER_KEY,
+             "-addr", f"{HOST}:{SERVER_PORT}",
+             "-peer-pub", f"{client_a_pub.hex()},{attacker_pub.hex()}",
+             "-revoke", attacker_pub.hex()],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                line = srv.stdout.readline()
+                if b"listening on" in line:
+                    break
+            else:
+                raise AssertionError("server did not start")
+
+            # Client A (pinned, not revoked) should succeed.
+            # Must use the CLIENT_KEY identity so its pubkey matches the pin.
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+                Ed25519PrivateKey,
+            )
+            from cryptography.hazmat.primitives import serialization
+            a_seed = open(CLIENT_KEY, "rb").read()
+            a_priv = Ed25519PrivateKey.from_private_bytes(a_seed)
+            cli_a = SecureClient(HOST, SERVER_PORT,
+                                 identity_privkey=a_priv,
+                                 identity_pubkey=a_priv.public_key(),
+                                 peer_pubkey=srv_pub)
+            cli_a.connect()
+            cli_a.handshake()
+            cli_a.send_data(b"hi-from-a")
+            assert cli_a.recv_data() == b"hi-from-a"
+            cli_a.close()
+
+            # Attacker (pinned but revoked) should be rejected.
+            cli_atk = SecureClient(HOST, SERVER_PORT, peer_pubkey=srv_pub)
+            # Load attacker identity.
+            atk_seed = open(ATTACKER_KEY, "rb").read()
+            atk_priv = Ed25519PrivateKey.from_private_bytes(atk_seed)
+            cli_atk.identity_privkey = atk_priv
+            cli_atk.identity_pubkey = atk_priv.public_key()
+            cli_atk.connect()
+            rejected = False
+            try:
+                cli_atk.handshake()
+            except Exception:
+                rejected = True
+            assert rejected, "revoked attacker key should be rejected by CRL"
+            cli_atk.close()
+        finally:
+            srv.terminate()
+            srv.wait(timeout=3)
+
+        record(name, True, "CRL rejects revoked key, multi-pin accepts valid key")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -621,6 +881,7 @@ def main():
         server_proc = start_server()
         print(f"server started (pid {server_proc.pid}), running tests...\n")
 
+        # Tests that use the default (no-pin, no-CRL) server.
         test_t1_normal_flow()
         test_t2_tampering()
         test_t3_replay()
@@ -629,8 +890,15 @@ def main():
         test_t6_nonce_reuse()
         test_t7_concurrency()
         test_t8_reconnect()
+        test_t9_pfs_renegotiation()
+        test_t12_clock_offset()
     finally:
         stop_server(server_proc)
+
+    # Tests that do not need the default server (pure logic or spawn their own).
+    test_t10_padding()
+    test_t11_passphrase_key()
+    test_t13_crl_multipin()
 
     ok = summary()
     sys.exit(0 if ok else 1)

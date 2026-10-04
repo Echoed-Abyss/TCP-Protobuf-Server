@@ -1,7 +1,10 @@
 package transport
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
+	"io"
 	"time"
 
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/crypto"
@@ -54,13 +57,18 @@ func (c *Conn) dispatchFrame(f *protocol.Frame, sess *session.Session) error {
 		protocol.GlobalMetrics.ReplayRejected.Add(1)
 		return protocol.ErrReplay
 	}
-	if !checkTimeWindow(f, time.Duration(protocol.DataTimeWindow)) {
+	if !c.checkTimeWindow(f, time.Duration(protocol.DataTimeWindow)) {
 		protocol.GlobalMetrics.ExpiredRejected.Add(1)
 		return protocol.ErrExpired
 	}
 
 	aad := aadFor(f, sess.SessionID())
-	plaintext, err := sess.Decrypt(f.Seq, f.Payload, aad)
+	padded, err := sess.Decrypt(f.Seq, f.Payload, aad)
+	if err != nil {
+		protocol.GlobalMetrics.DecryptFailed.Add(1)
+		return protocol.ErrDecryptFailed
+	}
+	plaintext, err := protocol.UnpadWithPrefix(padded)
 	if err != nil {
 		protocol.GlobalMetrics.DecryptFailed.Add(1)
 		return protocol.ErrDecryptFailed
@@ -74,8 +82,18 @@ func (c *Conn) dispatchFrame(f *protocol.Frame, sess *session.Session) error {
 		}
 	case protocol.MsgTypeHeartbeat:
 		// Heartbeat received; nothing to do. The peer is alive.
+	case protocol.MsgTypeDummy:
+		// Cover traffic; ignore the payload.
 	case protocol.MsgTypeRekey:
 		if err := c.handleRekey(plaintext); err != nil {
+			return err
+		}
+	case protocol.MsgTypeRenegClientHello,
+		protocol.MsgTypeRenegServerHello,
+		protocol.MsgTypeRenegServerProof,
+		protocol.MsgTypeRenegClientFinished,
+		protocol.MsgTypeRenegServerFinished:
+		if err := c.handleRenegotiationFrame(f.MsgType, plaintext); err != nil {
 			return err
 		}
 	case protocol.MsgTypeAlert:
@@ -88,7 +106,8 @@ func (c *Conn) dispatchFrame(f *protocol.Frame, sess *session.Session) error {
 }
 
 // startHeartbeat starts the heartbeat goroutine. It sends a heartbeat frame
-// every HeartbeatInterval and checks session key expiry.
+// every HeartbeatInterval, checks session key expiry (triggers PFS
+// renegotiation), and periodically sends dummy/cover frames with jitter.
 func (c *Conn) startHeartbeat() {
 	c.heartbeatWg.Add(1)
 	go c.heartbeatLoop()
@@ -96,21 +115,26 @@ func (c *Conn) startHeartbeat() {
 
 func (c *Conn) heartbeatLoop() {
 	defer c.heartbeatWg.Done()
-	ticker := time.NewTicker(time.Duration(protocol.HeartbeatInterval))
-	defer ticker.Stop()
+	hbTicker := time.NewTicker(time.Duration(protocol.HeartbeatInterval))
+	defer hbTicker.Stop()
+
+	dummyTimer := time.NewTimer(c.nextDummyDelay())
+	defer dummyTimer.Stop()
 
 	for {
 		select {
 		case <-c.heartbeatStop:
 			return
-		case <-ticker.C:
-			// Check session key TTL; rekey if expired.
+		case <-hbTicker.C:
+			// Check session key TTL; trigger full renegotiation (PFS)
+			// when expired. Full renegotiation uses fresh X25519 keys so
+			// the new session is forward-secret.
 			sess := c.getSession()
 			if sess != nil && sess.IsExpired(time.Duration(protocol.SessionKeyTTL)) {
-				if err := c.InitiateRekey(); err != nil {
-					// If key_id is exhausted, we must close so the peer
-					// reconnects with a fresh handshake (which resets
-					// key_id to 1 with new X25519 key material).
+				if err := c.InitiateRenegotiate(); err != nil {
+					// Renegotiation failed (e.g. key_id exhaustion or
+					// peer non-cooperation). Close so the peer reconnects
+					// with a completely fresh handshake.
 					c.Close()
 					return
 				}
@@ -121,8 +145,53 @@ func (c *Conn) heartbeatLoop() {
 				c.Close()
 				return
 			}
+		case <-dummyTimer.C:
+			// Send a dummy/cover frame to obfuscate traffic timing.
+			if err := c.sendDummyFrame(); err != nil {
+				c.Close()
+				return
+			}
+			dummyTimer.Reset(c.nextDummyDelay())
 		}
 	}
+}
+
+// nextDummyDelay returns a randomized delay for the next dummy frame.
+// Base interval ± jitter, clamped to >= 1ms.
+func (c *Conn) nextDummyDelay() time.Duration {
+	base := protocol.DummyFrameInterval
+	jitter := protocol.DummyFrameJitter
+	if base == 0 {
+		// Dummy frames disabled; return a very long duration.
+		return time.Duration(1<<63 - 1)
+	}
+	// random in [-jitter, +jitter]
+	r := randomInt63n(jitter*2) - jitter
+	d := base + r
+	if d < 1e6 { // at least 1ms
+		d = 1e6
+	}
+	return time.Duration(d)
+}
+
+// sendDummyFrame sends a cover-traffic frame with random payload.
+func (c *Conn) sendDummyFrame() error {
+	payload := randomBytes(protocol.DefaultDummyPayloadSize)
+	return c.writeEncrypted(protocol.MsgTypeDummy, payload)
+}
+
+// randomInt63n returns a pseudo-random int64 in [0, n) using crypto/rand.
+func randomInt63n(n int64) int64 {
+	if n <= 0 {
+		return 0
+	}
+	b := make([]byte, 8)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return 0
+	}
+	// Use the lower 63 bits.
+	v := int64(binary.BigEndian.Uint64(b) & 0x7FFFFFFFFFFFFFFF)
+	return v % n
 }
 
 // InitiateRekey starts a key rotation. It mixes fresh randomness into the

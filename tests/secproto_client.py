@@ -46,9 +46,18 @@ MSG_DATA = 6
 MSG_HEARTBEAT = 7
 MSG_REKEY = 8
 MSG_ALERT = 9
+MSG_RENEG_CLIENT_HELLO = 10
+MSG_RENEG_SERVER_HELLO = 11
+MSG_RENEG_SERVER_PROOF = 12
+MSG_RENEG_CLIENT_FINISHED = 13
+MSG_RENEG_SERVER_FINISHED = 14
+MSG_DUMMY = 15
 
 # Cipher suites
 CIPHER_AES256GCM = 1
+
+# Padding block size (must match server's protocol.PaddingBlockSize).
+PADDING_BLOCK_SIZE = 16
 
 # Time windows (nanoseconds)
 TIMESTAMP_WINDOW_NS = 60 * 10**9
@@ -136,12 +145,13 @@ def _parse_fields(data):
 
 class ClientHello:
     def __init__(self, version, cipher_suites, client_random,
-                 client_eph_pubkey, client_identity_pubkey):
+                 client_eph_pubkey, client_identity_pubkey, client_time=0):
         self.version = version
         self.cipher_suites = cipher_suites
         self.client_random = client_random
         self.client_eph_pubkey = client_eph_pubkey
         self.client_identity_pubkey = client_identity_pubkey
+        self.client_time = client_time
 
     def marshal(self):
         return (
@@ -150,17 +160,19 @@ class ClientHello:
             + _encode_bytes_field(3, self.client_random)
             + _encode_bytes_field(4, self.client_eph_pubkey)
             + _encode_bytes_field(5, self.client_identity_pubkey)
+            + _encode_varint_field(7, self.client_time)
         )
 
 
 class ServerHello:
     def __init__(self, version=0, cipher_suite=0, server_random=b"",
-                 server_eph_pubkey=b"", server_identity_pubkey=b""):
+                 server_eph_pubkey=b"", server_identity_pubkey=b"", server_time=0):
         self.version = version
         self.cipher_suite = cipher_suite
         self.server_random = server_random
         self.server_eph_pubkey = server_eph_pubkey
         self.server_identity_pubkey = server_identity_pubkey
+        self.server_time = server_time
 
     @classmethod
     def unmarshal(cls, data):
@@ -176,6 +188,8 @@ class ServerHello:
                 obj.server_eph_pubkey = val
             elif fn == 5 and wt == 2:
                 obj.server_identity_pubkey = val
+            elif fn == 6 and wt == 0:
+                obj.server_time = val
         return obj
 
 
@@ -292,6 +306,30 @@ def nonce_for_seq(prefix, seq):
     return prefix + struct.pack(">Q", seq)
 
 
+def pad_with_prefix(plaintext, block_size=PADDING_BLOCK_SIZE):
+    """Pad plaintext: [uint32 len BE][plaintext][zero padding to block]."""
+    body = struct.pack(">I", len(plaintext)) + plaintext
+    if block_size > 1:
+        rem = len(body) % block_size
+        if rem != 0:
+            body += b"\x00" * (block_size - rem)
+    return body
+
+
+def unpad_with_prefix(padded):
+    """Reverse pad_with_prefix. Verifies padding bytes are zero."""
+    if len(padded) < 4:
+        raise ValueError("padded data too short")
+    n = struct.unpack(">I", padded[:4])[0]
+    if n + 4 > len(padded):
+        raise ValueError("padded length exceeds buffer")
+    plaintext = padded[4:4 + n]
+    for b in padded[4 + n:]:
+        if b != 0:
+            raise ValueError("non-zero padding byte")
+    return plaintext
+
+
 def derive_rekey_keys(prev_traffic_secret, new_random):
     """Derive new session keys for a rekey, matching Go's DeriveRekeyKeys.
 
@@ -381,6 +419,7 @@ class SecureClient:
             client_random=client_random,
             client_eph_pubkey=client_eph_pub,
             client_identity_pubkey=client_id_pub,
+            client_time=time.time_ns(),
         )
         ch_bytes = ch.marshal()
         self._sendall(build_frame(MSG_CLIENT_HELLO, 0, 0, ch_bytes))
@@ -438,7 +477,8 @@ class SecureClient:
         aad = header_bytes_for_aad(frame_dict) + self.keys["session_id"]
         nonce = nonce_for_seq(self.keys["client_nonce_prefix"], seq)
         aesgcm = AESGCM(self.keys["client_key"])
-        ct = aesgcm.encrypt(nonce, payload, aad)
+        padded = pad_with_prefix(payload)
+        ct = aesgcm.encrypt(nonce, padded, aad)
         self._sendall(build_frame(msg_type, self.key_id, seq, ct, timestamp_ns=ts))
 
     def _recv_encrypted(self):
@@ -448,7 +488,8 @@ class SecureClient:
         aad = header_bytes_for_aad(frame) + self.keys["session_id"]
         nonce = nonce_for_seq(self.keys["server_nonce_prefix"], seq)
         aesgcm = AESGCM(self.keys["server_key"])
-        return aesgcm.decrypt(nonce, frame["payload"], aad)
+        padded = aesgcm.decrypt(nonce, frame["payload"], aad)
+        return unpad_with_prefix(padded)
 
     def send_data(self, data):
         self._send_encrypted(MSG_DATA, data)
@@ -475,6 +516,75 @@ class SecureClient:
         # Seq resets on key rotation (safe because key material changed).
         self.client_seq = 0
         self.server_seq = 0
+
+    def renegotiate(self):
+        """Perform a full re-handshake for forward secrecy (PFS).
+
+        Exchanges fresh X25519 ephemeral keys (encrypted under the current
+        session key) and derives completely new session keys. Unlike rekey,
+        the new keys are NOT derived from the old traffic secret, so
+        compromise of the old key does not reveal the new session.
+        """
+        from cryptography.hazmat.primitives.asymmetric.x25519 import (
+            X25519PrivateKey, X25519PublicKey,
+        )
+        client_eph = X25519PrivateKey.generate()
+        client_random = os.urandom(32)
+        client_eph_pub = self._raw_pubkey(client_eph.public_key())
+        client_id_pub = self._raw_pubkey(self.identity_pubkey)
+
+        ch = ClientHello(
+            version=PROTOCOL_VERSION,
+            cipher_suites=[CIPHER_AES256GCM],
+            client_random=client_random,
+            client_eph_pubkey=client_eph_pub,
+            client_identity_pubkey=client_id_pub,
+            client_time=time.time_ns(),
+        )
+        ch_bytes = ch.marshal()
+        self._send_encrypted(MSG_RENEG_CLIENT_HELLO, ch_bytes)
+
+        # Receive RenegServerHello.
+        sh_payload = self._recv_encrypted()
+        sh = ServerHello.unmarshal(sh_payload)
+
+        # Receive RenegServerProof.
+        sp_payload = self._recv_encrypted()
+        sp = ServerProof.unmarshal(sp_payload)
+
+        # Verify server signature over chBytes || shBytes.
+        server_id_pub = Ed25519PublicKey.from_public_bytes(
+            sh.server_identity_pubkey)
+        transcript1 = ch_bytes + sh_payload
+        server_id_pub.verify(sp.signature, transcript1)
+
+        # Derive new session keys from fresh X25519 shared secret.
+        server_eph_pub = X25519PublicKey.from_public_bytes(
+            sh.server_eph_pubkey)
+        shared = client_eph.exchange(server_eph_pub)
+        new_keys = derive_session_keys(shared, client_random, sh.server_random)
+
+        # Save old keys for PFS verification.
+        old_keys = self.keys
+
+        # Send ClientFinished with signature over full transcript.
+        full_transcript = ch_bytes + sh_payload + sp_payload
+        client_sig = self.identity_privkey.sign(full_transcript)
+        cf_bytes = ClientFinished(client_sig).marshal()
+        self._send_encrypted(MSG_RENEG_CLIENT_FINISHED, cf_bytes)
+
+        # Install new keys (seq resets).
+        self.keys = new_keys
+        self.key_id = 1
+        self.client_seq = 0
+        self.server_seq = 0
+
+        # Receive ServerFinished.
+        sf_payload = self._recv_encrypted()
+        sf = ServerFinished.unmarshal(sf_payload)
+        assert sf.success, "server rejected renegotiation"
+
+        return old_keys
 
     # --- Test helpers for attack scenarios ---
 
@@ -504,7 +614,8 @@ class SecureClient:
         aad = header_bytes_for_aad(frame_dict) + self.keys["session_id"]
         nonce = nonce_for_seq(self.keys["client_nonce_prefix"], seq)
         aesgcm = AESGCM(self.keys["client_key"])
-        ct = aesgcm.encrypt(nonce, payload, aad)
+        padded = pad_with_prefix(payload)
+        ct = aesgcm.encrypt(nonce, padded, aad)
         return build_frame(msg_type, key_id, seq, ct, timestamp_ns=timestamp_ns)
 
     def build_encrypted_frame_bytes_with_key(self, msg_type, payload, seq,
@@ -526,5 +637,6 @@ class SecureClient:
         aad = header_bytes_for_aad(frame_dict) + session_id
         nonce = nonce_for_seq(client_nonce_prefix, seq)
         aesgcm = AESGCM(client_key)
-        ct = aesgcm.encrypt(nonce, payload, aad)
+        padded = pad_with_prefix(payload)
+        ct = aesgcm.encrypt(nonce, padded, aad)
         return build_frame(msg_type, key_id, seq, ct, timestamp_ns=timestamp_ns)
