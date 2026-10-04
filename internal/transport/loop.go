@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"errors"
 	"time"
 
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/crypto"
@@ -16,6 +17,9 @@ import (
 //
 // Application data is delivered via the OnData callback.
 // Heartbeat and Rekey frames are handled internally.
+//
+// All security failures are wrapped into a generic public error and subject
+// to the constant failure delay, so callers cannot distinguish failure modes.
 func (c *Conn) ReadLoop() error {
 	for {
 		if c.isClosed() {
@@ -23,33 +27,42 @@ func (c *Conn) ReadLoop() error {
 		}
 		sess := c.getSession()
 		if sess == nil {
-			return protocol.ErrNotReady
+			return c.fail(protocol.ErrNotReady)
 		}
 
 		f, err := c.readFrame()
 		if err != nil {
+			// Network errors / EOF: not security-sensitive, return as-is.
 			return err
 		}
 
 		if err := c.dispatchFrame(f, sess); err != nil {
-			return err
+			if errors.Is(err, protocol.ErrClosed) {
+				return err
+			}
+			return c.fail(err)
 		}
 	}
 }
 
 // dispatchFrame handles a single received frame.
 func (c *Conn) dispatchFrame(f *protocol.Frame, sess *session.Session) error {
+	protocol.GlobalMetrics.FramesReceived.Add(1)
+
 	// Replay + time-window checks before decryption.
 	if !sess.CheckReplay(f.Seq) {
+		protocol.GlobalMetrics.ReplayRejected.Add(1)
 		return protocol.ErrReplay
 	}
 	if !checkTimeWindow(f, time.Duration(protocol.DataTimeWindow)) {
+		protocol.GlobalMetrics.ExpiredRejected.Add(1)
 		return protocol.ErrExpired
 	}
 
 	aad := aadFor(f, sess.SessionID())
 	plaintext, err := sess.Decrypt(f.Seq, f.Payload, aad)
 	if err != nil {
+		protocol.GlobalMetrics.DecryptFailed.Add(1)
 		return protocol.ErrDecryptFailed
 	}
 	sess.AcceptReplay(f.Seq)
@@ -69,7 +82,7 @@ func (c *Conn) dispatchFrame(f *protocol.Frame, sess *session.Session) error {
 		// Peer sent an alert; close the connection.
 		return protocol.ErrClosed
 	default:
-		// Unknown message type; drop.
+		// Unknown message type; drop silently.
 	}
 	return nil
 }
@@ -95,6 +108,9 @@ func (c *Conn) heartbeatLoop() {
 			sess := c.getSession()
 			if sess != nil && sess.IsExpired(time.Duration(protocol.SessionKeyTTL)) {
 				if err := c.InitiateRekey(); err != nil {
+					// If key_id is exhausted, we must close so the peer
+					// reconnects with a fresh handshake (which resets
+					// key_id to 1 with new X25519 key material).
 					c.Close()
 					return
 				}
@@ -109,25 +125,28 @@ func (c *Conn) heartbeatLoop() {
 	}
 }
 
-// InitiateRekey starts a key rotation. It generates a new ephemeral key,
-// derives new keys, and sends a Rekey frame. The peer must also rotate.
+// InitiateRekey starts a key rotation. It mixes fresh randomness into the
+// traffic secret via HKDF to derive new session keys, then sends a Rekey
+// frame. The peer rotates to the same new keys.
 //
-// Rekey protocol:
-//   1. Initiator generates new ephemeral key + random, sends Rekey{new_pubkey, new_random}
-//   2. Both sides compute new shared secret = X25519(new_priv, peer's old or new pub?) 
+// Security note: rekey uses HKDF(old_traffic_secret || new_random) to derive
+// the new traffic secret. This is NOT a fresh X25519 exchange, so it does not
+// provide post-compromise forward secrecy (if old_traffic_secret is leaked,
+// new keys can be derived). For full forward secrecy, perform a complete
+// re-handshake instead. Rekey is used for key lifetime / nonce-space
+// management, not forward secrecy.
 //
-// For simplicity and security, rekey uses the existing session's traffic
-// secret mixed with new randomness (no new ECDH round-trip needed). This
-// provides forward-security-like key evolution without an extra handshake.
-//
-// Actually, to maintain forward secrecy properly, we do a fresh X25519.
-// But that requires exchanging new ephemeral keys. Let's do the simpler
-// HKDF-based rekey: new_traffic_secret = HKDF(old_traffic_secret || new_random).
-// This is secure as long as old_traffic_secret is not compromised.
+// If key_id has reached MaxKeyID, this returns ErrRekeyOverflow and the
+// caller must close the connection and re-establish via a fresh handshake.
 func (c *Conn) InitiateRekey() error {
 	sess := c.getSession()
 	if sess == nil {
 		return protocol.ErrNotReady
+	}
+
+	// Check before doing any work: if key_id is exhausted, refuse.
+	if sess.KeyID() >= protocol.MaxKeyID {
+		return protocol.ErrRekeyOverflow
 	}
 
 	newRandom := randomBytes(32)
@@ -140,7 +159,7 @@ func (c *Conn) InitiateRekey() error {
 
 	// Send Rekey frame with the new random (encrypted with current key).
 	rk := &secpb.Rekey{
-		NewKeyId: uint32(sess.KeyID() + 1),
+		NewKeyId:  uint32(sess.KeyID() + 1),
 		NewRandom: newRandom,
 	}
 	rkBytes, err := proto.Marshal(rk)

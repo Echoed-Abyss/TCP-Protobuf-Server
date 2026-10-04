@@ -30,12 +30,12 @@ func (c *Conn) Handshake() error {
 	if c.isClient {
 		if err := c.clientHandshake(); err != nil {
 			c.Close()
-			return protocol.NewPublicError(err)
+			return c.fail(err)
 		}
 	} else {
 		if err := c.serverHandshake(); err != nil {
 			c.Close()
-			return protocol.NewPublicError(err)
+			return c.fail(err)
 		}
 	}
 
@@ -87,9 +87,10 @@ func (c *Conn) clientHandshake() error {
 		return protocol.ErrHandshake
 	}
 
-	// Optional peer identity pinning.
-	if c.peerID != nil && !crypto.SecureEqual(sh.ServerIdentityPubkey, c.peerID) {
-		return protocol.ErrHandshake
+	// Verify server identity: pinned key, TOFU store, or accept.
+	if err := c.verifyPeerTrust(sh.ServerIdentityPubkey); err != nil {
+		protocol.GlobalMetrics.HandshakeFailed.Add(1)
+		return err
 	}
 
 	// 4. Receive ServerProof.
@@ -187,6 +188,12 @@ func (c *Conn) serverHandshake() error {
 		return protocol.ErrHandshake
 	}
 
+	// Verify client identity: pinned key, TOFU store, or accept.
+	if err := c.verifyPeerTrust(ch.ClientIdentityPubkey); err != nil {
+		protocol.GlobalMetrics.HandshakeFailed.Add(1)
+		return err
+	}
+
 	// 3. Generate ephemeral key and random.
 	serverEph, err := crypto.GenerateEphemeral()
 	if err != nil {
@@ -257,11 +264,7 @@ func (c *Conn) serverHandshake() error {
 	}
 	fullTranscript := append(append(append([]byte{}, chBytes...), shBytes...), spBytes...)
 	if !crypto.VerifySignature(ch.ClientIdentityPubkey, fullTranscript, cf.Signature) {
-		return protocol.ErrHandshake
-	}
-
-	// Optional peer identity pinning.
-	if c.peerID != nil && !crypto.SecureEqual(ch.ClientIdentityPubkey, c.peerID) {
+		protocol.GlobalMetrics.HandshakeFailed.Add(1)
 		return protocol.ErrHandshake
 	}
 
@@ -319,21 +322,26 @@ func (c *Conn) readEncrypted() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	protocol.GlobalMetrics.FramesReceived.Add(1)
 	if f.KeyID != sess.KeyID() {
-		// Possibly a rekey in progress; for simplicity reject.
+		// key_id mismatch: either a rekey race or an attack. Reject.
+		protocol.GlobalMetrics.DecryptFailed.Add(1)
 		return nil, protocol.ErrDecryptFailed
 	}
 	// Replay check BEFORE decryption.
 	if !sess.CheckReplay(f.Seq) {
+		protocol.GlobalMetrics.ReplayRejected.Add(1)
 		return nil, protocol.ErrReplay
 	}
 	if !checkTimeWindow(f, time.Duration(protocol.DataTimeWindow)) {
+		protocol.GlobalMetrics.ExpiredRejected.Add(1)
 		return nil, protocol.ErrExpired
 	}
 
 	aad := aadFor(f, sess.SessionID())
 	plaintext, err := sess.Decrypt(f.Seq, f.Payload, aad)
 	if err != nil {
+		protocol.GlobalMetrics.DecryptFailed.Add(1)
 		return nil, protocol.ErrDecryptFailed
 	}
 	// Mark as seen only after successful decryption.

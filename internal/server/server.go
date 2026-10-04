@@ -6,13 +6,15 @@ import (
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/crypto"
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/protocol"
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/transport"
+	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/trust"
 )
 
 // Server accepts TCP connections and runs the secure protocol handshake.
 type Server struct {
-	listener net.Listener
-	identity *crypto.IdentityKey
-	logger   *protocol.SensitiveLogger
+	listener   net.Listener
+	identity   *crypto.IdentityKey
+	logger     *protocol.SensitiveLogger
+	trustStore *trust.Store
 
 	// OnConn is called for each successfully handshaken connection.
 	OnConn func(c *transport.Conn)
@@ -24,6 +26,12 @@ func NewServer(identity *crypto.IdentityKey) *Server {
 		identity: identity,
 		logger:   protocol.NewSensitiveLogger("[server] "),
 	}
+}
+
+// SetTrustStore enables TOFU / pinned-key verification for incoming clients.
+// The client's remote address is used as the trust-store identifier.
+func (s *Server) SetTrustStore(store *trust.Store) {
+	s.trustStore = store
 }
 
 // Listen starts listening on the given address.
@@ -55,7 +63,12 @@ func (s *Server) handleConn(raw net.Conn) {
 	c := transport.NewConn(raw, s.identity, false)
 	defer c.Close()
 
+	if s.trustStore != nil {
+		c.SetTrustStore(s.trustStore, raw.RemoteAddr().String())
+	}
+
 	if err := c.Handshake(); err != nil {
+		protocol.GlobalMetrics.HandshakeFailed.Add(1)
 		s.logger.Printf("handshake failed from %s: %v", raw.RemoteAddr(), err)
 		return
 	}

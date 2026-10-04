@@ -1,5 +1,7 @@
 package protocol
 
+import "errors"
+
 // Protocol magic number. Frames that don't start with this are dropped.
 const Magic uint16 = 0x5343 // "SC"
 
@@ -71,3 +73,15 @@ const HeartbeatInterval int64 = 15 * 1e9 // 15 seconds
 
 // SessionKeyTTL is the lifetime of a session key before rekey is required.
 const SessionKeyTTL int64 = 3600 * 1e9 // 1 hour
+
+// MaxKeyID is the highest key_id value allowed for in-band rekey.
+// key_id is a uint8, so it can hold 0..255. We reserve the top range
+// (251..255) so that incrementing never wraps silently. When key_id reaches
+// MaxKeyID, the next rotation MUST be a full renegotiation (new handshake),
+// not an in-band rekey. This guarantees the (key, nonce) space never wraps.
+const MaxKeyID uint8 = 250
+
+// RekeyOverflow is the error returned when an in-band rekey is attempted
+// but key_id has reached MaxKeyID. The caller must perform a full
+// renegotiation (close and re-handshake) instead.
+var ErrRekeyOverflow = errors.New("key id exhausted; full renegotiation required")

@@ -174,9 +174,30 @@ func (s *Session) TrafficSecret() []byte {
 
 // Rotate replaces the session's ciphers with new keys (from a rekey).
 // The keyID is incremented.
+//
+// Key rotation invariants (nonce reuse proof):
+//
+//	AEAD nonce = nonce_prefix(4) || seq(8).
+//	For a fixed key K, seq is monotonic per direction, so all nonces are
+//	unique per K. When rotating to K', the key material changes (derived
+//	from a fresh IKM via HKDF), so K' ≠ K. AEAD security only requires
+//	(key, nonce) uniqueness, not global nonce uniqueness. Therefore even if
+//	seq resets to 0 after rotation, no (key, nonce) pair collides with any
+//	past pair. The nonce prefix also changes with overwhelming probability
+//	(defense in depth).
+//
+// If keyID has reached MaxKeyID, Rotate returns ErrRekeyOverflow and the
+// caller MUST perform a full renegotiation (new handshake) instead of
+// continuing in-band rekeys.
 func (s *Session) Rotate(newKeys *crypto.SessionKeys, suite protocol.CipherSuite, isClient bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Refuse to rotate if key_id would exceed MaxKeyID. Force full
+	// renegotiation so the key_id space resets cleanly.
+	if s.keyID >= protocol.MaxKeyID {
+		return protocol.ErrRekeyOverflow
+	}
 
 	var writeKey, writeNP, readKey, readNP []byte
 	if isClient {
@@ -196,14 +217,19 @@ func (s *Session) Rotate(newKeys *crypto.SessionKeys, suite protocol.CipherSuite
 		return err
 	}
 
+	// Wipe old key material references.
 	s.writeCipher = newWrite
 	s.readCipher = newRead
 	s.keyID++
+	// Reset sequence numbers for the new key. As proven above, this is safe
+	// because the key has changed.
+	s.writeSeq = 0
 	s.sessionID = newKeys.SessionID
 	s.createdAt = time.Now()
-	// Reset the replay window for the new key since seq numbering continues
-	// but the key changes. The window is fresh for the new key.
+	// Reset the replay window: seq numbering restarts from 0 for the new key.
 	s.readWindow = crypto.NewReplayWindow(protocol.ReplayWindowSize)
+
+	protocol.GlobalMetrics.KeyRotations.Add(1)
 	return nil
 }
 

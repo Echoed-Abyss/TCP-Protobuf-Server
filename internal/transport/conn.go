@@ -12,6 +12,7 @@ import (
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/crypto"
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/protocol"
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/session"
+	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/trust"
 )
 
 // Conn is a secure, authenticated TCP connection.
@@ -49,9 +50,18 @@ type Conn struct {
 	// callbacks
 	onData func(data []byte)
 
-	// timeouts
+	// timeouts applied to every read/write.
 	readTimeout  time.Duration
 	writeTimeout time.Duration
+
+	// failureDelay is a constant delay applied before returning any security
+	// failure (replay, expired, decrypt failed, handshake failed). It makes
+	// failure modes harder to distinguish by timing.
+	failureDelay time.Duration
+
+	// trust store for TOFU / pinned peer identity verification.
+	trustStore     *trust.Store
+	peerIdentifier string // label used in the trust store (e.g. dial address)
 }
 
 // NewConn wraps an existing net.Conn. The identity key is used for
@@ -65,6 +75,7 @@ func NewConn(raw net.Conn, identity *crypto.IdentityKey, isClient bool) *Conn {
 		heartbeatStop: make(chan struct{}),
 		readTimeout:   30 * time.Second,
 		writeTimeout:  10 * time.Second,
+		failureDelay:  5 * time.Millisecond,
 	}
 }
 
@@ -78,6 +89,30 @@ func (c *Conn) SetOnData(fn func(data []byte)) {
 func (c *Conn) SetPeerID(pub []byte) {
 	c.peerID = make([]byte, len(pub))
 	copy(c.peerID, pub)
+}
+
+// SetTrustStore configures TOFU / pinned-key verification for this
+// connection. identifier is the label under which the peer's key is stored
+// (e.g. the dial address for clients).
+func (c *Conn) SetTrustStore(store *trust.Store, identifier string) {
+	c.trustStore = store
+	c.peerIdentifier = identifier
+}
+
+// verifyPeerTrust checks the peer's identity key against the trust store
+// (if configured) and the pinned peerID. Returns ErrHandshake on mismatch.
+func (c *Conn) verifyPeerTrust(peerPub []byte) error {
+	if c.peerID != nil && !crypto.SecureEqual(peerPub, c.peerID) {
+		return protocol.ErrHandshake
+	}
+	if c.trustStore != nil && c.peerIdentifier != "" {
+		if err := c.trustStore.VerifyOrTrust(c.peerIdentifier, peerPub); err != nil {
+			// Trust mismatch: possible MITM or rotation. Map to handshake error
+			// so the external error stays generic.
+			return protocol.ErrHandshake
+		}
+	}
+	return nil
 }
 
 // RemoteAddr returns the remote address.
@@ -194,7 +229,24 @@ func deriveNonceBytes(seq uint64) []byte {
 
 // SendData sends application data (encrypted).
 func (c *Conn) SendData(data []byte) error {
-	return c.writeEncrypted(protocol.MsgTypeData, data)
+	if err := c.writeEncrypted(protocol.MsgTypeData, data); err != nil {
+		return c.fail(err)
+	}
+	return nil
+}
+
+// fail applies the constant failure delay and wraps the internal error into
+// a generic public error so callers (and remote peers) cannot distinguish
+// failure modes. Network/EOF errors are returned as-is since they carry no
+// security-relevant detail.
+func (c *Conn) fail(internalErr error) error {
+	if internalErr == nil {
+		return nil
+	}
+	if c.failureDelay > 0 {
+		time.Sleep(c.failureDelay)
+	}
+	return protocol.NewPublicError(internalErr)
 }
 
 // randomBytes returns n cryptographically random bytes.

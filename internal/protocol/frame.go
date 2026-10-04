@@ -63,20 +63,29 @@ func (f *Frame) Marshal() []byte {
 }
 
 // HeaderBytes returns the authenticated portion of the header (everything
-// except the payload). This is used as the AAD for AEAD.
+// except the payload and the nonce/length fields). This is used as the AAD
+// for AEAD.
 //
-// AAD = Magic || Version || MsgType || KeyID || Seq || Timestamp
-// The session_id is appended by the caller.
+// AAD = Magic(2) || Version(1) || MsgType(1) || KeyID(1) || Seq(8) || Timestamp(8)
+// The session_id is appended by the caller (see transport.aadFor).
+//
+// Including Timestamp in the AAD means an attacker cannot tamper with the
+// timestamp without breaking the AEAD tag, so time-window replay protection
+// is cryptographically bound to the frame.
 func (f *Frame) HeaderBytes() []byte {
-	buf := make([]byte, 25) // magic(2)+ver(1)+type(1)+keyid(1)+seq(8)+timestamp(8) = 21... wait
-	// Actually: 2+1+1+1+8+8 = 21 bytes. Let me be precise.
-	buf = make([]byte, 2+1+1+1+8+8)
-	binary.BigEndian.PutUint16(buf[0:2], f.Magic)
-	buf[2] = f.Version
-	buf[3] = uint8(f.MsgType)
-	buf[4] = f.KeyID
-	binary.BigEndian.PutUint64(buf[5:13], f.Seq)
-	binary.BigEndian.PutUint64(buf[13:21], f.Timestamp)
+	buf := make([]byte, MagicSize+VersionSize+MsgTypeSize+KeyIDSize+SeqSize+TimestampSize)
+	off := 0
+	binary.BigEndian.PutUint16(buf[off:off+MagicSize], f.Magic)
+	off += MagicSize
+	buf[off] = f.Version
+	off += VersionSize
+	buf[off] = uint8(f.MsgType)
+	off += MsgTypeSize
+	buf[off] = f.KeyID
+	off += KeyIDSize
+	binary.BigEndian.PutUint64(buf[off:off+SeqSize], f.Seq)
+	off += SeqSize
+	binary.BigEndian.PutUint64(buf[off:off+TimestampSize], f.Timestamp)
 	return buf
 }
 
@@ -89,15 +98,18 @@ func ParseHeader(r io.Reader) (*Frame, uint32, error) {
 	}
 	magic := binary.BigEndian.Uint16(hdr[0:2])
 	if magic != Magic {
+		GlobalMetrics.InvalidFrame.Add(1)
 		return nil, 0, ErrInvalidFrame
 	}
 	version := hdr[2]
 	if version < MinSupportedVersion || version > ProtocolVersion {
+		GlobalMetrics.InvalidFrame.Add(1)
 		return nil, 0, ErrInvalidFrame
 	}
 	seq := binary.BigEndian.Uint64(hdr[5:13])
 	payloadLen := binary.BigEndian.Uint32(hdr[33:37])
 	if payloadLen > MaxFramePayload {
+		GlobalMetrics.InvalidFrame.Add(1)
 		return nil, 0, ErrInvalidFrame
 	}
 	f := &Frame{
