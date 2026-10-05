@@ -3,10 +3,13 @@ package transport
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/crypto"
@@ -31,6 +34,17 @@ type Conn struct {
 
 	identity *crypto.IdentityKey
 	peerID   []byte // peer's Ed25519 public key, set after handshake
+
+	// connID is a process-unique identifier for this connection, used by
+	// the admin connection-management endpoints. It is assigned at creation.
+	connID uint64
+
+	// connectedAt records when the handshake completed.
+	connectedAt time.Time
+
+	// byte counters for admin stats (bytes on the wire, header+payload).
+	bytesSent atomic.Uint64
+	bytesRecv atomic.Uint64
 
 	session   *session.Session
 	sessionMu sync.RWMutex
@@ -72,6 +86,9 @@ type Conn struct {
 	clockOffset int64
 }
 
+// connIDCounter allocates process-unique connection IDs.
+var connIDCounter atomic.Uint64
+
 // NewConn wraps an existing net.Conn. The identity key is used for
 // authentication. isClient determines the handshake role.
 func NewConn(raw net.Conn, identity *crypto.IdentityKey, isClient bool) *Conn {
@@ -80,11 +97,43 @@ func NewConn(raw net.Conn, identity *crypto.IdentityKey, isClient bool) *Conn {
 		reader:        bufio.NewReaderSize(raw, 64*1024),
 		identity:      identity,
 		isClient:      isClient,
+		connID:        connIDCounter.Add(1),
 		heartbeatStop: make(chan struct{}),
 		readTimeout:   30 * time.Second,
 		writeTimeout:  10 * time.Second,
 		failureDelay:  5 * time.Millisecond,
 	}
+}
+
+// ConnID returns the process-unique connection identifier.
+func (c *Conn) ConnID() uint64 { return c.connID }
+
+// PeerFingerprint returns a short, non-reversible fingerprint of the peer's
+// identity public key for logging/admin display. Never returns the raw key.
+func (c *Conn) PeerFingerprint() string {
+	if len(c.peerID) == 0 {
+		return ""
+	}
+	h := sha256.Sum256(c.peerID)
+	return hex.EncodeToString(h[:8])
+}
+
+// BytesSent returns the cumulative bytes written to the wire.
+func (c *Conn) BytesSent() uint64 { return c.bytesSent.Load() }
+
+// BytesRecv returns the cumulative bytes read from the wire.
+func (c *Conn) BytesRecv() uint64 { return c.bytesRecv.Load() }
+
+// ConnectedAt returns when the handshake completed (zero if not yet done).
+func (c *Conn) ConnectedAt() time.Time { return c.connectedAt }
+
+// CurrentKeyID returns the current session key id (0 before handshake).
+func (c *Conn) CurrentKeyID() uint8 {
+	sess := c.getSession()
+	if sess == nil {
+		return 0
+	}
+	return sess.KeyID()
 }
 
 // SetOnData registers a callback for received application data.
@@ -165,7 +214,11 @@ func (c *Conn) writeFrame(f *protocol.Frame) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	_ = c.raw.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-	_, err := c.raw.Write(data)
+	n, err := c.raw.Write(data)
+	c.bytesSent.Add(uint64(n))
+	if err == nil {
+		protocol.GlobalMetrics.FramesSent.Add(1)
+	}
 	return err
 }
 
@@ -175,7 +228,11 @@ func (c *Conn) readFrame() (*protocol.Frame, error) {
 		return nil, protocol.ErrClosed
 	}
 	_ = c.raw.SetReadDeadline(time.Now().Add(c.readTimeout))
-	return protocol.ReadFrame(c.reader)
+	f, err := protocol.ReadFrame(c.reader)
+	if err == nil {
+		c.bytesRecv.Add(uint64(protocol.HeaderSize + len(f.Payload)))
+	}
+	return f, err
 }
 
 // getSession returns the current session (nil if handshake not done).
@@ -211,7 +268,7 @@ func (c *Conn) writeEncrypted(msgType protocol.MsgType, payload []byte) error {
 	f := protocol.NewFrame(msgType, sess.KeyID(), seq, nil, nil)
 	aad := aadFor(f, sess.SessionID())
 
-	padded := protocol.PadWithPrefix(payload, protocol.PaddingBlockSize)
+	padded := protocol.PadWithPrefix(payload, protocol.PaddingBlock())
 	ciphertext := sess.Encrypt(seq, padded, aad)
 	f.Payload = ciphertext
 	// Populate the nonce field with the deterministic nonce for explicitness.
@@ -281,6 +338,16 @@ func (c *Conn) checkTimeWindow(f *protocol.Frame, maxSkew time.Duration) bool {
 		diff = -diff
 	}
 	return diff <= maxSkew.Nanoseconds()
+}
+
+// dataTimeWindow returns the current data-frame time window (runtime-configurable).
+func dataTimeWindow() time.Duration {
+	return time.Duration(protocol.GlobalConfig.DataTimeWindow.Load())
+}
+
+// handshakeTimeWindow returns the current handshake time window (runtime-configurable).
+func handshakeTimeWindow() time.Duration {
+	return time.Duration(protocol.GlobalConfig.HandshakeTimeWindow.Load())
 }
 
 // estimateClockOffset computes the estimated offset between the local clock

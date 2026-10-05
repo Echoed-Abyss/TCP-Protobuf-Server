@@ -40,6 +40,8 @@ func (c *Conn) Handshake() error {
 	}
 
 	c.handshakeDone = true
+	c.connectedAt = time.Now()
+	protocol.GlobalMetrics.HandshakeOK.Add(1)
 	c.startHeartbeat()
 	return nil
 }
@@ -313,7 +315,7 @@ func (c *Conn) readPlaintext(expected protocol.MsgType) ([]byte, error) {
 	if f.MsgType != expected {
 		return nil, protocol.ErrHandshake
 	}
-	if !c.checkTimeWindow(f, time.Duration(protocol.HandshakeTimeWindow)) {
+	if !c.checkTimeWindow(f, handshakeTimeWindow()) {
 		return nil, protocol.ErrExpired
 	}
 	return f.Payload, nil
@@ -341,7 +343,7 @@ func (c *Conn) readEncrypted() ([]byte, error) {
 		protocol.GlobalMetrics.ReplayRejected.Add(1)
 		return nil, protocol.ErrReplay
 	}
-	if !c.checkTimeWindow(f, time.Duration(protocol.DataTimeWindow)) {
+	if !c.checkTimeWindow(f, dataTimeWindow()) {
 		protocol.GlobalMetrics.ExpiredRejected.Add(1)
 		return nil, protocol.ErrExpired
 	}

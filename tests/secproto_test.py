@@ -865,6 +865,244 @@ def test_t13_crl_multipin():
 
 
 # ---------------------------------------------------------------------------
+# T14: Application-layer action over the encrypted channel
+# ---------------------------------------------------------------------------
+def test_t14_appapi_action():
+    name = "T14 App-layer action (echo over encrypted channel)"
+    try:
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = SecureClient(HOST, SERVER_PORT, peer_pubkey=srv_pub)
+        cli.connect()
+        cli.handshake()
+
+        import json as _json
+
+        # Send a JSON appapi echo request inside an encrypted DATA frame.
+        req = {
+            "ver": 1,
+            "req_id": "t14-echo",
+            "action": "echo",
+            "timeout_ms": 1000,
+            "payload": {"hello": "world", "n": 42},
+        }
+        cli.send_data(_json.dumps(req).encode())
+
+        # Receive the JSON response (decrypted plaintext).
+        raw = cli.recv_data()
+        resp = _json.loads(raw)
+
+        assert resp["ver"] == 1, f"unexpected ver: {resp.get('ver')}"
+        assert resp["req_id"] == "t14-echo", f"req_id not echoed: {resp.get('req_id')}"
+        assert resp["ok"] is True, f"expected ok=true, got {resp}"
+        assert resp["code"] == "ok", f"expected code=ok, got {resp.get('code')}"
+        assert resp["data"]["hello"] == "world", f"echo payload mismatch: {resp['data']}"
+        assert resp["data"]["n"] == 42
+
+        # server.stats action returns live metrics.
+        req2 = {
+            "ver": 1, "req_id": "t14-stats", "action": "server.stats",
+            "timeout_ms": 1000, "payload": {},
+        }
+        cli.send_data(_json.dumps(req2).encode())
+        resp2 = _json.loads(cli.recv_data())
+        assert resp2["ok"] is True
+        assert "frames_received" in resp2["data"]
+
+        cli.close()
+        record(name, True, "echo + server.stats returned correct JSON")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# T15: Unregistered action / bad JSON -> unified business error, no leak
+# ---------------------------------------------------------------------------
+def test_t15_appapi_errors():
+    name = "T15 App-layer errors (unregistered action + bad JSON)"
+    try:
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = SecureClient(HOST, SERVER_PORT, peer_pubkey=srv_pub)
+        cli.connect()
+        cli.handshake()
+
+        import json as _json
+
+        # Unregistered action -> not_found.
+        req = {
+            "ver": 1, "req_id": "t15-bad", "action": "no.such.action",
+            "timeout_ms": 1000, "payload": {},
+        }
+        cli.send_data(_json.dumps(req).encode())
+        resp = _json.loads(cli.recv_data())
+        assert resp["ok"] is False, f"expected ok=false: {resp}"
+        assert resp["code"] == "not_found", f"expected not_found: {resp.get('code')}"
+        assert resp["req_id"] == "t15-bad"
+        # Error message must be generic (no internal detail).
+        assert resp["error"] != ""
+
+        # Malformed JSON -> bad_request.
+        cli.send_data(b"{this is not json")
+        resp2 = _json.loads(cli.recv_data())
+        assert resp2["ok"] is False
+        assert resp2["code"] == "bad_request", f"expected bad_request: {resp2.get('code')}"
+        assert resp2["error"] != ""
+
+        # Missing required fields (no action) -> bad_request.
+        req3 = {"ver": 1, "req_id": "t15-missing", "payload": {}}
+        cli.send_data(_json.dumps(req3).encode())
+        resp3 = _json.loads(cli.recv_data())
+        assert resp3["code"] == "bad_request"
+
+        # kv.set then kv.get round-trip.
+        cli.send_data(_json.dumps({
+            "ver": 1, "req_id": "t15-set", "action": "kv.set",
+            "payload": {"key": "k", "value": "v"},
+        }).encode())
+        assert _json.loads(cli.recv_data())["ok"] is True
+
+        cli.send_data(_json.dumps({
+            "ver": 1, "req_id": "t15-get", "action": "kv.get",
+            "payload": {"key": "k"},
+        }).encode())
+        g = _json.loads(cli.recv_data())
+        assert g["data"]["value"] == "v"
+
+        cli.close()
+        record(name, True, "unregistered->not_found, bad json->bad_request, kv round-trip ok")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# T16: Admin interface (stats, hot-config, auth enforcement)
+# ---------------------------------------------------------------------------
+ADMIN_PORT = 29090
+ADMIN_TOKEN = "test-admin-token-secret"
+
+
+def _admin_request(method, path, token=None, body=None):
+    """Make an HTTP request to the admin interface. Returns (status, body)."""
+    import urllib.request
+    import urllib.error
+
+    url = f"http://{HOST}:{ADMIN_PORT}{path}"
+    data = None
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if body is not None:
+        import json as _json
+        data = _json.dumps(body).encode()
+    # Bypass any HTTP proxy (sandbox env sets HTTP_PROXY). Admin is
+    # localhost-only and must be reached directly.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with opener.open(req, timeout=5) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+    except Exception as e:
+        return None, str(e)
+
+
+def test_t16_admin():
+    name = "T16 Admin interface (stats, hot-config, auth)"
+    try:
+        import json as _json
+
+        # Start a server with admin enabled.
+        srv = subprocess.Popen(
+            [SECPROTO_BIN, "-role", "server", "-key", SERVER_KEY,
+             "-addr", f"{HOST}:{SERVER_PORT}",
+             "-admin-bind", f"{HOST}:{ADMIN_PORT}",
+             "-admin-token", ADMIN_TOKEN],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        try:
+            # Wait for both "listening on" (TCP) and "admin UI" lines.
+            deadline = time.time() + 5
+            saw_tcp = saw_admin = False
+            while time.time() < deadline and not (saw_tcp and saw_admin):
+                line = srv.stdout.readline()
+                if not line:
+                    time.sleep(0.1)
+                    continue
+                if b"listening on" in line:
+                    saw_tcp = True
+                if b"admin UI" in line:
+                    saw_admin = True
+            assert saw_tcp and saw_admin, "server with admin did not start"
+
+            # 1. GET /admin/stats without token -> 401.
+            status, _ = _admin_request("GET", "/admin/stats")
+            assert status == 401, f"expected 401 without token, got {status}"
+
+            # 2. GET /admin/stats with wrong token -> 401.
+            status, _ = _admin_request("GET", "/admin/stats", token="wrong")
+            assert status == 401, f"expected 401 with wrong token, got {status}"
+
+            # 3. GET /admin/stats with valid token -> 200 + metrics.
+            status, body = _admin_request("GET", "/admin/stats", token=ADMIN_TOKEN)
+            assert status == 200, f"expected 200 with valid token, got {status}"
+            stats = _json.loads(body)
+            assert "metrics" in stats
+            assert "handshake_ok" in stats["metrics"]
+
+            # 4. GET /admin/healthz (no auth) -> 200.
+            status, hbody = _admin_request("GET", "/admin/healthz")
+            assert status == 200, f"healthz expected 200, got {status}"
+            assert _json.loads(hbody)["status"] == "ok"
+
+            # 5. GET /admin/config -> hot + static sections.
+            status, cbody = _admin_request("GET", "/admin/config", token=ADMIN_TOKEN)
+            assert status == 200
+            cfg = _json.loads(cbody)
+            assert "hot" in cfg and "static" in cfg
+            old_hb = cfg["hot"]["heartbeat_interval_ns"]
+
+            # 6. PUT /admin/config -> hot-change heartbeat interval.
+            new_hb = 20_000_000_000  # 20s
+            status, ubody = _admin_request(
+                "PUT", "/admin/config", token=ADMIN_TOKEN,
+                body={"heartbeat_interval_ns": new_hb},
+            )
+            assert status == 200, f"PUT config failed: {status} {ubody}"
+            updated = _json.loads(ubody)
+            assert updated["hot"]["heartbeat_interval_ns"] == new_hb
+
+            # Verify via GET.
+            status, cbody2 = _admin_request("GET", "/admin/config", token=ADMIN_TOKEN)
+            assert _json.loads(cbody2)["hot"]["heartbeat_interval_ns"] == new_hb
+
+            # Restore original value.
+            _admin_request("PUT", "/admin/config", token=ADMIN_TOKEN,
+                           body={"heartbeat_interval_ns": old_hb})
+
+            # 7. PUT config without token -> 401.
+            status, _ = _admin_request(
+                "PUT", "/admin/config",
+                body={"heartbeat_interval_ns": new_hb},
+            )
+            assert status == 401, f"PUT without token should be 401, got {status}"
+
+            # 8. /metrics endpoint with token returns Prometheus text.
+            status, mbody = _admin_request("GET", "/metrics", token=ADMIN_TOKEN)
+            assert status == 200
+            assert "secproto_handshake_ok" in mbody
+
+            record(name, True, "stats/config/healthz/auth all behave correctly")
+        finally:
+            srv.terminate()
+            srv.wait(timeout=3)
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -892,6 +1130,8 @@ def main():
         test_t8_reconnect()
         test_t9_pfs_renegotiation()
         test_t12_clock_offset()
+        test_t14_appapi_action()
+        test_t15_appapi_errors()
     finally:
         stop_server(server_proc)
 
@@ -899,6 +1139,7 @@ def main():
     test_t10_padding()
     test_t11_passphrase_key()
     test_t13_crl_multipin()
+    test_t16_admin()
 
     ok = summary()
     sys.exit(0 if ok else 1)
