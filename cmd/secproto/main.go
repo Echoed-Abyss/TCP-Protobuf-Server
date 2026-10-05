@@ -39,6 +39,10 @@ type Config struct {
 	// Admin management plane (localhost + token only).
 	AdminBind  string // e.g. 127.0.0.1:9090
 	AdminToken string // bearer token for admin endpoints
+
+	// ActionsDB is the SQLite file holding runtime-defined actions
+	// (created/edited from the admin UI rather than compiled in).
+	ActionsDB string
 }
 
 func main() {
@@ -90,6 +94,7 @@ func loadConfig() *Config {
 	flag.StringVar(&cfg.Passphrase, "passphrase", "", "identity key passphrase (insecure; prefer SECPROTO_PASSPHRASE)")
 	flag.StringVar(&cfg.AdminBind, "admin-bind", envOr("SECPROTO_ADMIN_BIND", "127.0.0.1:9090"), "admin HTTP bind address (loopback only)")
 	flag.StringVar(&cfg.AdminToken, "admin-token", envOr("SECPROTO_ADMIN_TOKEN", ""), "admin bearer token (required if admin enabled)")
+	flag.StringVar(&cfg.ActionsDB, "actions-db", envOr("SECPROTO_ACTIONS_DB", "actions.db"), "SQLite file holding runtime-defined actions")
 	cfg.PassphraseEnv = os.Getenv("SECPROTO_PASSPHRASE")
 	flag.Parse()
 	return cfg
@@ -228,6 +233,17 @@ func runServer(cfg *Config) error {
 	// transport. Business JSON never leaves the AEAD channel.
 	appSrv := appapi.NewServer(appapi.NewRegistry(), 0)
 	appSrv.RegisterDefaults()
+
+	// Runtime-defined actions: definitions live in a SQLite file that the
+	// admin UI edits; no recompile is needed to add or change an action.
+	actStore, err := appapi.NewActionStore(cfg.ActionsDB)
+	if err != nil {
+		return fmt.Errorf("action store %q: %w", cfg.ActionsDB, err)
+	}
+	defer actStore.Close()
+	appSrv.EnableDynamicActions(actStore)
+	fmt.Printf("runtime actions: %s (%d defined)\n", cfg.ActionsDB, len(actStore.List()))
+
 	// ServeConn blocks (drives the read loop and drains in-flight requests
 	// on close); the server's own ReadLoop call becomes a no-op.
 	srv.OnConn = func(c *transport.Conn) { _ = appSrv.ServeConn(c) }
@@ -281,6 +297,7 @@ func runServer(cfg *Config) error {
 		if err != nil {
 			return fmt.Errorf("admin init: %w", err)
 		}
+		adm.SetActionStore(actStore)
 		// Health self-check: key file should not be world-readable.
 		adm.SetHealthCheck(func() error {
 			info, statErr := os.Stat(cfg.KeyFile)

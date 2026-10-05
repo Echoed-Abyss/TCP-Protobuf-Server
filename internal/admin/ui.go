@@ -49,6 +49,28 @@ const uiHTML = `<!DOCTYPE html>
   <h2>活跃连接</h2>
   <table id="conns"><thead><tr><th>ID</th><th>Peer</th><th>地址</th><th>KeyID</th><th>发/收字节</th><th>操作</th></tr></thead><tbody></tbody></table>
 </div>
+<div class="card">
+  <h2>动作管理（运行时定义，无需改代码）</h2>
+  <p><button id="actNew" type="button">新建动作</button> <span id="actmsg" class="ok"></span></p>
+  <table id="actlist"><thead><tr><th>名称</th><th>状态</th><th>说明</th><th>操作</th></tr></thead><tbody></tbody></table>
+</div>
+<div class="card">
+  <h2>动作定义</h2>
+  <table>
+    <tr><td>名称</td><td><input type="text" id="actName" placeholder="get_xuan_accpass"></td></tr>
+    <tr><td>启用</td><td><select id="actEnabled"><option value="true">是</option><option value="false">否</option></select></td></tr>
+    <tr><td>说明</td><td><input type="text" id="actDesc" placeholder="查询玄账号密码"></td></tr>
+    <tr><td>必填字段</td><td><input type="text" id="actRequired" placeholder="qq,appid（逗号分隔，可空）"></td></tr>
+    <tr><td>查表键</td><td><input type="text" id="actKey" placeholder="qq（留空表示纯模板，不查表）"></td></tr>
+    <tr><td>数据行</td><td><textarea id="actRows" rows="5" style="width:360px;font-family:monospace">[]</textarea></td></tr>
+    <tr><td>响应模板</td><td><textarea id="actResp" rows="6" style="width:360px;font-family:monospace">{}</textarea></td></tr>
+  </table>
+  <p><button id="actSave" type="button">保存</button> <button id="actDel" type="button">删除</button></p>
+  <h2>试运行</h2>
+  <p>请求 payload：<textarea id="actPayload" rows="3" style="width:360px;font-family:monospace">{"qq":10001}</textarea></p>
+  <p><button id="actTest" type="button">试运行</button></p>
+  <pre id="actResult" style="max-height:220px;overflow:auto;background:#f5f5f5;padding:8px;border-radius:6px;font-size:.8rem"></pre>
+</div>
 <script>
 const TOKEN = prompt("请输入 admin token") || "";
 // Write requests require the X-Admin-Action custom header as a CSRF
@@ -115,6 +137,77 @@ async function closeConn(id){
   await fetch("/admin/connections/"+id+"/close",{method:"POST",headers:H});
   refresh();
 }
+// ---- 运行时动作管理 ----
+// 动作定义保存在服务端的 JSON store 里，保存后立即对所有连接生效，
+// 不需要重启服务或改代码。
+function actMsg(s){document.getElementById("actmsg").textContent=s}
+async function refreshActions(){
+  try{
+    const list=await get("/admin/actions");
+    const tb=document.querySelector("#actlist tbody");tb.textContent="";
+    for(const a of (list||[])){
+      const tr=document.createElement("tr");
+      const cells=[a.name,a.enabled?"启用":"停用",a.desc||""];
+      for(const v of cells){const td=document.createElement("td");td.textContent=v;tr.appendChild(td)}
+      const td=document.createElement("td");
+      const b1=document.createElement("button");b1.type="button";b1.textContent="编辑";b1.onclick=()=>loadAction(a);
+      const b2=document.createElement("button");b2.type="button";b2.textContent="删除";b2.style.marginLeft="6px";b2.onclick=()=>removeAction(a.name);
+      td.appendChild(b1);td.appendChild(b2);tr.appendChild(td);tb.appendChild(tr);
+    }
+  }catch(e){console.error(e)}
+}
+function loadAction(a){
+  document.getElementById("actName").value=a.name;
+  document.getElementById("actEnabled").value=a.enabled?"true":"false";
+  document.getElementById("actDesc").value=a.desc||"";
+  document.getElementById("actRequired").value=(a.required||[]).join(",");
+  document.getElementById("actKey").value=(a.lookup&&a.lookup.key)||"";
+  document.getElementById("actRows").value=JSON.stringify((a.lookup&&a.lookup.rows)||[],null,2);
+  document.getElementById("actResp").value=JSON.stringify(a.response||{},null,2);
+  actMsg("已载入 "+a.name);
+}
+async function saveAction(){
+  let rows,resp;
+  try{rows=JSON.parse(document.getElementById("actRows").value||"[]")}catch(e){actMsg("数据行不是合法 JSON");return}
+  try{resp=JSON.parse(document.getElementById("actResp").value||"{}")}catch(e){actMsg("响应模板不是合法 JSON");return}
+  const key=document.getElementById("actKey").value.trim();
+  const def={
+    name:document.getElementById("actName").value.trim(),
+    enabled:document.getElementById("actEnabled").value==="true",
+    desc:document.getElementById("actDesc").value.trim(),
+    required:document.getElementById("actRequired").value.split(",").map(s=>s.trim()).filter(s=>s.length>0),
+    response:resp
+  };
+  if(key){def.lookup={key:key,rows:rows}}
+  const r=await fetch("/admin/actions",{method:"PUT",headers:H,body:JSON.stringify(def)});
+  const j=await r.json();
+  actMsg(j.ok?("已保存 "+def.name):("失败: "+(j.error||"")));
+  refreshActions();
+}
+async function removeAction(name){
+  const r=await fetch("/admin/actions/"+encodeURIComponent(name),{method:"DELETE",headers:H});
+  const j=await r.json();
+  actMsg(j.ok?("已删除 "+name):("失败: "+(j.error||"")));
+  refreshActions();
+}
+async function testAction(){
+  let payload;
+  try{payload=JSON.parse(document.getElementById("actPayload").value||"{}")}catch(e){actMsg("payload 不是合法 JSON");return}
+  const r=await fetch("/admin/actions/test",{method:"POST",headers:H,body:JSON.stringify({name:document.getElementById("actName").value.trim(),payload:payload})});
+  const j=await r.json();
+  document.getElementById("actResult").textContent=JSON.stringify(j,null,2);
+}
+document.getElementById("actNew").onclick=()=>{
+  ["actName","actDesc","actRequired","actKey"].forEach(i=>{document.getElementById(i).value=""});
+  document.getElementById("actRows").value="[]";
+  document.getElementById("actResp").value=JSON.stringify({message:"hello"},null,2);
+  actMsg("填写后点保存");
+};
+document.getElementById("actSave").onclick=saveAction;
+document.getElementById("actDel").onclick=()=>{const n=document.getElementById("actName").value.trim();if(n)removeAction(n)};
+document.getElementById("actTest").onclick=testAction;
+refreshActions();
+
 refresh();setInterval(refresh,3000);
 </script>
 </body>

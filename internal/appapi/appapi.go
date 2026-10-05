@@ -81,9 +81,15 @@ type Response struct {
 type Handler func(ctx context.Context, req *Request) (*Response, error)
 
 // Registry maps action names to handlers. It is safe for concurrent use.
+//
+// A registry may also carry a single fallback handler. It is consulted when
+// no exact match exists, which is how runtime-defined actions (see
+// NewActionStore / DynamicRouter) are served without recompiling: the
+// fallback receives the original request and dispatches on req.Action.
 type Registry struct {
 	mu       sync.RWMutex
 	handlers map[string]Handler
+	fallback Handler
 }
 
 // NewRegistry creates an empty registry.
@@ -92,19 +98,42 @@ func NewRegistry() *Registry {
 }
 
 // Register registers a handler for the given action. Overwrites any existing
-// handler for that action.
+// handler for that action. Registered handlers always win over the fallback.
 func (r *Registry) Register(action string, h Handler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.handlers[action] = h
 }
 
+// SetFallback installs the handler used for actions that are not registered
+// explicitly. Pass nil to remove it.
+func (r *Registry) SetFallback(h Handler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fallback = h
+}
+
 // Get returns the handler for the action, or (nil, false) if not registered.
+// It does NOT consult the fallback; use Lookup for dispatch.
 func (r *Registry) Get(action string) (Handler, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	h, ok := r.handlers[action]
 	return h, ok
+}
+
+// Lookup resolves the handler for dispatch: exact match first, then the
+// fallback. Returns (nil, false) when neither exists.
+func (r *Registry) Lookup(action string) (Handler, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if h, ok := r.handlers[action]; ok {
+		return h, true
+	}
+	if r.fallback != nil {
+		return r.fallback, true
+	}
+	return nil, false
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +321,8 @@ func (s *Server) handle(data []byte, state *connState) *Response {
 		return cached
 	}
 
-	h, ok := s.registry.Get(req.Action)
+	// Exact registered handler first, then the runtime-defined fallback.
+	h, ok := s.registry.Lookup(req.Action)
 	if !ok {
 		resp := errResp(req.ReqID, CodeNotFound, "action not found")
 		state.dedup.Put(req.ReqID, resp)

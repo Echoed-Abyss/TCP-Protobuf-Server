@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/appapi"
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/protocol"
 )
 
@@ -52,6 +53,15 @@ type Server struct {
 	// authMu protects authFailures.
 	authMu       sync.Mutex
 	authFailures map[string]*authRecord // source IP -> failure record
+
+	// actions is the runtime-defined action store behind /admin/actions.
+	// Nil disables those endpoints.
+	actions *appapi.ActionStore
+}
+
+// SetActionStore enables runtime action management (list/upsert/delete/test).
+func (s *Server) SetActionStore(store *appapi.ActionStore) {
+	s.actions = store
 }
 
 // ConnManager is the interface the admin server uses to inspect and close
@@ -132,6 +142,9 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/admin/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/admin/connections", s.requireAuth(s.handleConnections))
 	mux.HandleFunc("/admin/connections/", s.requireAuth(s.handleConnectionOp))
+	mux.HandleFunc("/admin/actions", s.requireAuth(s.handleActions))
+	mux.HandleFunc("/admin/actions/test", s.requireAuth(s.handleActionTest))
+	mux.HandleFunc("/admin/actions/", s.requireAuth(s.handleActionOp))
 	mux.HandleFunc("/admin/healthz", s.handleHealthz) // no auth needed: liveness only
 	// The UI shell is served WITHOUT auth on purpose: it is a static page
 	// whose only job is to prompt for the token and then call the
