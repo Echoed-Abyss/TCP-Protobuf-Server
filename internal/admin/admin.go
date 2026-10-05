@@ -133,7 +133,13 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/admin/connections", s.requireAuth(s.handleConnections))
 	mux.HandleFunc("/admin/connections/", s.requireAuth(s.handleConnectionOp))
 	mux.HandleFunc("/admin/healthz", s.handleHealthz) // no auth needed: liveness only
-	mux.HandleFunc("/admin/", s.requireAuth(s.handleUI))
+	// The UI shell is served WITHOUT auth on purpose: it is a static page
+	// whose only job is to prompt for the token and then call the
+	// authenticated JSON endpoints below. Gating the page itself behind
+	// requireAuth made the browser flow impossible, because a top-level
+	// navigation cannot carry an Authorization header. The shell contains
+	// no secrets; every data/mutating endpoint stays behind requireAuth.
+	mux.HandleFunc("/admin/", s.handleUI)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	})
