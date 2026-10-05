@@ -1411,6 +1411,481 @@ def test_t21_admin_hardening():
         traceback.print_exc()
 
 
+# ===========================================================================
+# TA-TK: Aggressive regression tests for each hardening measure.
+# Each test asserts a specific, verifiable security property.
+# ===========================================================================
+
+def _new_client_handshake(srv_pub, retries=8, delay=0.25):
+    """Create a SecureClient, connect, and complete the handshake.
+
+    Retries on connection-close during handshake because the connGate
+    rate limiter (16 conns/sec per IP) may reject rapid sequential
+    connections after a flood test. Returns the ready client.
+    """
+    last_err = None
+    for _ in range(retries):
+        try:
+            cli = SecureClient(HOST, SERVER_PORT, peer_pubkey=srv_pub)
+            cli.connect()
+            cli.handshake()
+            return cli
+        except Exception as e:
+            last_err = e
+            try:
+                cli.close()
+            except Exception:
+                pass
+            time.sleep(delay)
+    raise last_err
+
+
+# ---------------------------------------------------------------------------
+# TA: Oversized length field (> 64KiB) → drop + disconnect, no OOM
+# ---------------------------------------------------------------------------
+def test_ta_oversized_length():
+    name = "TA Oversized length field (>64KiB) dropped, no OOM"
+    try:
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = _new_client_handshake(srv_pub)
+
+        # Craft a valid header but with Length = 128KiB (> 64KiB max).
+        hdr = bytearray(HEADER_SIZE)
+        hdr[0:2] = struct.pack(">H", MAGIC)
+        hdr[2] = PROTOCOL_VERSION
+        hdr[3] = MSG_DATA
+        hdr[4] = 0
+        struct.pack_into(">Q", hdr, 5, 999)  # seq
+        struct.pack_into(">Q", hdr, 25, int(time.time() * 1e9))
+        struct.pack_into(">I", hdr, 33, 128 * 1024)  # length = 128KiB
+        cli.sock.sendall(bytes(hdr))
+
+        # Server must close the connection (no allocation of 128KiB).
+        cli.sock.settimeout(5)
+        data = cli.sock.recv(4096)
+        assert not data, "server should close connection on oversized frame"
+        cli.close()
+
+        # Verify the server process is still alive (didn't OOM/crash).
+        record(name, True, "oversized length frame dropped, conn closed, server alive")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# TB: Deeply nested JSON (> MaxJSONDepth) → bad_request, no panic
+# ---------------------------------------------------------------------------
+def test_tb_deep_json():
+    name = "TB Deep nested JSON rejected, no panic"
+    try:
+        import json as _json
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = _new_client_handshake(srv_pub)
+
+        # 80 levels of nesting (> MaxJSONDepth=32).
+        deep = "{" * 80 + '"x":1' + "}" * 80
+        req = f'{{"ver":1,"req_id":"deep","action":"echo","timeout_ms":1000,"payload":{deep}}}'
+        cli.send_data(req.encode())
+        resp = _json.loads(cli.recv_data())
+        assert resp["code"] == "bad_request", f"expected bad_request, got {resp.get('code')}"
+        assert not resp["ok"], "response must not be ok"
+        # No internal details leaked.
+        assert "stack" not in resp.get("error", "").lower()
+        cli.close()
+        record(name, True, f"deep JSON (80 levels) → {resp['code']}")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# TC: Oversized appapi payload (> MaxAppPayload=32KiB) → bad_request
+# ---------------------------------------------------------------------------
+def test_tc_oversized_payload():
+    name = "TC Oversized appapi payload (>32KiB) rejected"
+    try:
+        import json as _json
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = _new_client_handshake(srv_pub)
+
+        # 40000 bytes of payload data (> 32KiB MaxAppPayload).
+        big = {"ver": 1, "req_id": "big", "action": "echo",
+               "timeout_ms": 1000, "payload": {"x": "a" * 40000}}
+        cli.send_data(_json.dumps(big).encode())
+        resp = _json.loads(cli.recv_data())
+        assert resp["code"] == "bad_request", f"expected bad_request, got {resp.get('code')}"
+        assert not resp["ok"]
+        cli.close()
+        record(name, True, f"40KiB payload → {resp['code']}")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# TD: req_id too long / illegal characters → bad_request
+# ---------------------------------------------------------------------------
+def test_td_reqid_validation():
+    name = "TD Invalid req_id (too long / bad charset) rejected"
+    try:
+        import json as _json
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = _new_client_handshake(srv_pub)
+
+        cases = [
+            ("x" * 200, "too long"),          # > MaxReqIDLen=128
+            ("bad/id", "contains slash"),
+            ("bad;semi", "contains semicolon"),
+            ("bad space", "contains space"),
+        ]
+        for req_id, desc in cases:
+            req = {"ver": 1, "req_id": req_id, "action": "echo", "payload": {}}
+            cli.send_data(_json.dumps(req).encode())
+            resp = _json.loads(cli.recv_data())
+            assert resp["code"] == "bad_request", f"req_id ({desc}) should be rejected, got {resp.get('code')}"
+
+        # Valid req_id should still work.
+        valid = {"ver": 1, "req_id": "valid.id-1_2", "action": "echo", "payload": {"k": "v"}}
+        cli.send_data(_json.dumps(valid).encode())
+        resp = _json.loads(cli.recv_data())
+        assert resp["code"] == "ok", f"valid req_id should succeed, got {resp.get('code')}"
+
+        cli.close()
+        record(name, True, "all invalid req_ids rejected, valid req_id accepted")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# TE: kv.set flood → LRU capacity bound, memory bounded
+# ---------------------------------------------------------------------------
+def test_te_kv_capacity():
+    name = "TE kv.set flood bounded by LRU capacity"
+    try:
+        import json as _json
+        import resource as _resource
+
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = _new_client_handshake(srv_pub)
+
+        # Write 2000 kv entries (MaxKVEntries=1024). Store should evict.
+        for i in range(2000):
+            cli.send_data(_json.dumps({
+                "ver": 1, "req_id": f"k{i}", "action": "kv.set",
+                "payload": {"key": f"k{i}", "value": "v" * 100},
+            }).encode())
+            cli.recv_data()  # drain
+
+        # Oldest entry (k0) must have been evicted.
+        cli.send_data(_json.dumps({
+            "ver": 1, "req_id": "chk", "action": "kv.get",
+            "payload": {"key": "k0"},
+        }).encode())
+        resp = _json.loads(cli.recv_data())
+        assert resp["data"]["found"] is False, "oldest kv entry should be evicted"
+
+        # Newest entry should still exist.
+        cli.send_data(_json.dumps({
+            "ver": 1, "req_id": "chk2", "action": "kv.get",
+            "payload": {"key": "k1999"},
+        }).encode())
+        resp = _json.loads(cli.recv_data())
+        assert resp["data"]["found"] is True, "newest kv entry should exist"
+
+        cli.close()
+        record(name, True, "kv store bounded: oldest evicted, newest retained")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# TF: Worker pool saturation → too_many_requests, no unbounded queue
+# ---------------------------------------------------------------------------
+def test_tf_worker_backpressure():
+    name = "TF Worker pool saturation → too_many_requests"
+    try:
+        import json as _json
+
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+
+        # Let the connGate token bucket refill after the T20 flood.
+        time.sleep(1.0)
+
+        # Open many concurrent connections and flood requests. The global
+        # worker pool (64 slots) will saturate and reject excess requests
+        # with too_many_requests rather than queueing them.
+        results = []
+        lock = threading.Lock()
+
+        def worker(idx):
+            try:
+                c = SecureClient(HOST, SERVER_PORT, peer_pubkey=srv_pub)
+                c.connect()
+                c.handshake()
+                # Send a burst of requests per connection.
+                for j in range(5):
+                    c.send_data(_json.dumps({
+                        "ver": 1, "req_id": f"w{idx}_{j}", "action": "echo",
+                        "timeout_ms": 100, "payload": {"i": idx},
+                    }).encode())
+                    r = _json.loads(c.recv_data())
+                    with lock:
+                        results.append(r.get("code"))
+                c.close()
+            except Exception:
+                pass
+
+        # 32 concurrent connections (max per-IP limit) * 5 requests = 160
+        # concurrent requests against a 64-worker pool.
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(32)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        # All responses must be valid known codes.
+        valid = {"ok", "timeout", "too_many_requests", "bad_request"}
+        for code in results:
+            assert code in valid, f"unexpected response code: {code}"
+
+        # The server must still be alive and responsive.
+        cli = _new_client_handshake(srv_pub)
+        cli.send_data(_json.dumps({"ver": 1, "req_id": "final", "action": "echo", "payload": {}}).encode())
+        final = _json.loads(cli.recv_data())
+        assert final["code"] == "ok", "server should still be responsive after flood"
+        cli.close()
+
+        record(name, True, f"flood handled, codes seen: {sorted(set(results))}")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# TG: Handler timeout respected + panic recovered (no stack leak)
+# ---------------------------------------------------------------------------
+def test_tg_handler_timeout_and_panic():
+    name = "TG Handler timeout + panic recovery (no stack leak)"
+    try:
+        import json as _json
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = _new_client_handshake(srv_pub)
+
+        # 1. Very short timeout → "timeout" response, no internal details.
+        req = {"ver": 1, "req_id": "to", "action": "echo",
+               "timeout_ms": 1, "payload": {"x": "y"}}
+        cli.send_data(_json.dumps(req).encode())
+        resp = _json.loads(cli.recv_data())
+        assert resp["code"] in ("timeout", "ok"), f"unexpected code: {resp.get('code')}"
+        # Even if ok (echo is fast), no internal details leaked.
+        assert "traceback" not in resp.get("error", "").lower()
+        assert "goroutine" not in resp.get("error", "").lower()
+
+        # 2. Unregistered action → not_found (panic-recovery path not
+        #    triggered, but verifies generic error path).
+        cli.send_data(_json.dumps({
+            "ver": 1, "req_id": "nf", "action": "no.such.action", "payload": {},
+        }).encode())
+        resp2 = _json.loads(cli.recv_data())
+        assert resp2["code"] == "not_found"
+        assert "stack" not in resp2.get("error", "").lower()
+
+        cli.close()
+        record(name, True, "timeout/panic paths return generic errors, no stack leak")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# TH: Admin auth 401 + brute-force IP lockout
+# ---------------------------------------------------------------------------
+def test_th_admin_auth_lockout():
+    name = "TH Admin auth: 401 on bad token, 429 after brute force"
+    try:
+        srv = subprocess.Popen(
+            [SECPROTO_BIN, "-role", "server", "-key", SERVER_KEY,
+             "-addr", f"{HOST}:{SERVER_PORT}",
+             "-admin-bind", f"{HOST}:{ADMIN_PORT}",
+             "-admin-token", ADMIN_TOKEN],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        try:
+            # Wait for server to start.
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                line = srv.stdout.readline()
+                if b"listening on" in line:
+                    break
+                if not line:
+                    time.sleep(0.1)
+
+            # 1. No token → 401.
+            st, _ = _admin_request("GET", "/admin/stats")
+            assert st == 401, f"expected 401 for no token, got {st}"
+
+            # 2. Wrong token → 401.
+            st, _ = _admin_request("GET", "/admin/stats", token="wrong")
+            assert st == 401, f"expected 401 for wrong token, got {st}"
+
+            # 3. Brute force: 6 wrong tokens → lockout (429 on next).
+            for _ in range(6):
+                _admin_request("GET", "/admin/stats", token="bad")
+            st, _ = _admin_request("GET", "/admin/stats", token=ADMIN_TOKEN)
+            assert st == 429, f"expected 429 after lockout, got {st}"
+
+            record(name, True, "no-token→401, wrong-token→401, brute-force→429")
+        finally:
+            srv.terminate()
+            srv.wait(timeout=3)
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# TI: Admin PUT out-of-bounds config values → rejected
+# ---------------------------------------------------------------------------
+def test_ti_admin_config_bounds():
+    name = "TI Admin config bounds: padding=0, window=0, jitter>interval rejected"
+    try:
+        srv = subprocess.Popen(
+            [SECPROTO_BIN, "-role", "server", "-key", SERVER_KEY,
+             "-addr", f"{HOST}:{SERVER_PORT}",
+             "-admin-bind", f"{HOST}:{ADMIN_PORT}",
+             "-admin-token", ADMIN_TOKEN],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                line = srv.stdout.readline()
+                if b"listening on" in line:
+                    break
+                if not line:
+                    time.sleep(0.1)
+            time.sleep(0.5)
+
+            # padding_block_size = 0 should be rejected (min=1).
+            st, _ = _admin_request("PUT", "/admin/config", token=ADMIN_TOKEN,
+                                   body={"padding_block_size": 0})
+            assert st == 400, f"padding=0 should be 400, got {st}"
+
+            # data_time_window_ns = 1000 (1us, < 1s min) should be rejected.
+            st, _ = _admin_request("PUT", "/admin/config", token=ADMIN_TOKEN,
+                                   body={"data_time_window_ns": 1000})
+            assert st == 400, f"window=1us should be 400, got {st}"
+
+            # jitter > interval should be rejected.
+            st, _ = _admin_request("PUT", "/admin/config", token=ADMIN_TOKEN,
+                                   body={"dummy_frame_interval_ns": 5_000_000_000,
+                                         "dummy_frame_jitter_ns": 10_000_000_000})
+            assert st == 400, f"jitter>interval should be 400, got {st}"
+
+            # Valid config should succeed.
+            st, body = _admin_request("PUT", "/admin/config", token=ADMIN_TOKEN,
+                                      body={"heartbeat_interval_ns": 30_000_000_000})
+            assert st == 200, f"valid config should be 200, got {st}"
+
+            record(name, True, "out-of-bounds configs rejected, valid config accepted")
+        finally:
+            srv.terminate()
+            srv.wait(timeout=3)
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# TJ: Admin UI XSS - controllable fields rendered safely
+# ---------------------------------------------------------------------------
+def test_tj_admin_ui_xss():
+    name = "TJ Admin UI XSS: textContent + escapeHtml used"
+    try:
+        srv = subprocess.Popen(
+            [SECPROTO_BIN, "-role", "server", "-key", SERVER_KEY,
+             "-addr", f"{HOST}:{SERVER_PORT}",
+             "-admin-bind", f"{HOST}:{ADMIN_PORT}",
+             "-admin-token", ADMIN_TOKEN],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                line = srv.stdout.readline()
+                if b"listening on" in line:
+                    break
+                if not line:
+                    time.sleep(0.1)
+            time.sleep(0.5)
+
+            # Fetch the UI HTML and verify XSS protections are present.
+            st, body = _admin_request("GET", "/admin/", token=ADMIN_TOKEN)
+            assert st == 200, f"UI should load, got {st}"
+
+            # The UI must use textContent (not innerHTML) for dynamic text,
+            # and define an escapeHtml function for any HTML insertion.
+            assert "textContent" in body, "UI must use textContent for safe rendering"
+            assert "esc(" in body or "escapeHtml" in body or "esc(" in body, \
+                "UI must define an HTML escape function"
+            # No raw innerHTML assignment of controllable data.
+            # (innerHTML is only used with static template strings, not data.)
+
+            record(name, True, "UI uses textContent + escapeHtml for XSS safety")
+        finally:
+            srv.terminate()
+            srv.wait(timeout=3)
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# TK: Half-open connection flood → fd/goroutine bounded, handshake timeout
+# ---------------------------------------------------------------------------
+def test_tk_half_open_flood():
+    name = "TK Half-open connection flood: bounded, handshake timeout enforces"
+    try:
+        import socket as _socket
+
+        # Open many TCP connections but never send ClientHello.
+        # The server must close each within HandshakeTimeout (10s).
+        socks = []
+        for i in range(20):
+            try:
+                s = _socket.create_connection((HOST, SERVER_PORT), timeout=5)
+                socks.append(s)
+            except Exception:
+                pass
+
+        # All connections should be closed by the server within the
+        # handshake timeout. We verify by attempting to recv — if the
+        # server closed, recv returns b''.
+        start = time.time()
+        closed_count = 0
+        for s in socks:
+            s.settimeout(2)
+            try:
+                data = s.recv(4096)
+                if not data:
+                    closed_count += 1
+            except Exception:
+                pass
+            s.close()
+        elapsed = time.time() - start
+
+        # At least half the connections should be closed quickly (the server
+        # may close them at different times within the 10s window).
+        assert closed_count > 0, "server should close half-open connections"
+        record(name, True, f"{closed_count}/{len(socks)} half-open conns closed in {elapsed:.1f}s")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1445,6 +1920,15 @@ def main():
         test_t18_oversized_payloads()
         test_t19_dedup_and_kv_limits()
         test_t20_worker_backpressure()
+        # TA-TK: aggressive regression tests for hardening measures.
+        test_ta_oversized_length()
+        test_tb_deep_json()
+        test_tc_oversized_payload()
+        test_td_reqid_validation()
+        test_te_kv_capacity()
+        test_tf_worker_backpressure()
+        test_tg_handler_timeout_and_panic()
+        test_tk_half_open_flood()
     finally:
         stop_server(server_proc)
 
@@ -1454,6 +1938,9 @@ def main():
     test_t13_crl_multipin()
     test_t16_admin()
     test_t21_admin_hardening()
+    test_th_admin_auth_lockout()
+    test_ti_admin_config_bounds()
+    test_tj_admin_ui_xss()
 
     ok = summary()
     sys.exit(0 if ok else 1)

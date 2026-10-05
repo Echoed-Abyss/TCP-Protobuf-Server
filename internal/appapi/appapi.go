@@ -145,7 +145,15 @@ type Server struct {
 
 	// dedupSize is the per-connection dedup cache capacity.
 	dedupSize int
+
+	// failureDelay is a constant artificial delay applied to every error
+	// response so that clients cannot distinguish failure modes by timing.
+	failureDelay time.Duration
 }
+
+// DefaultFailureDelayMs is the constant delay applied to appapi error
+// responses to mitigate timing side-channels.
+const DefaultFailureDelayMs = 2
 
 // NewServer creates an application server. If maxWorkers <= 0,
 // DefaultMaxWorkers is used.
@@ -154,12 +162,13 @@ func NewServer(registry *Registry, maxWorkers int) *Server {
 		maxWorkers = DefaultMaxWorkers
 	}
 	return &Server{
-		registry:   registry,
-		maxWorkers: maxWorkers,
-		maxTimeout: time.Duration(DefaultMaxTimeoutMs) * time.Millisecond,
-		workers:    make(chan struct{}, maxWorkers),
-		kv:         newBoundedKV(MaxKVEntries),
-		dedupSize:  DefaultDedupSize,
+		registry:     registry,
+		maxWorkers:   maxWorkers,
+		maxTimeout:   time.Duration(DefaultMaxTimeoutMs) * time.Millisecond,
+		workers:      make(chan struct{}, maxWorkers),
+		kv:           newBoundedKV(MaxKVEntries),
+		dedupSize:    DefaultDedupSize,
+		failureDelay: time.Duration(DefaultFailureDelayMs) * time.Millisecond,
 	}
 }
 
@@ -233,10 +242,15 @@ func (s *Server) process(conn *transport.Conn, data []byte, state *connState) {
 }
 
 // sendResp marshals and sends a response, ignoring send errors (the read
-// loop surfaces connection failures).
+// loop surfaces connection failures). For non-OK responses a constant
+// artificial delay is applied so clients cannot distinguish failure modes
+// by response timing.
 func (s *Server) sendResp(conn *transport.Conn, resp *Response) {
 	if conn == nil {
 		return
+	}
+	if !resp.Ok && s.failureDelay > 0 {
+		time.Sleep(s.failureDelay)
 	}
 	b, err := json.Marshal(resp)
 	if err != nil {
@@ -386,8 +400,29 @@ func checkJSONDepth(data []byte, maxDepth int) error {
 
 var errDepthExceeded = errors.New("json nesting depth exceeded")
 
-// errResp builds a non-OK response with a generic error message.
-func errResp(reqID, code, msg string) *Response {
+// errResp builds a non-OK response with a generic error message. The
+// message is intentionally coarse and does not reveal which validation
+// check failed (e.g. "payload too large" vs "invalid req_id" both map to
+// "request rejected"). The stable `code` field is the only signal clients
+// may rely on.
+func errResp(reqID, code, _ string) *Response {
+	var msg string
+	switch code {
+	case CodeBadRequest:
+		msg = "request rejected"
+	case CodeNotFound:
+		msg = "not found"
+	case CodeTimeout:
+		msg = "timeout"
+	case CodeTooManyReqs:
+		msg = "busy"
+	case CodeInternal:
+		msg = "internal error"
+	case CodeDuplicate:
+		msg = "duplicate"
+	default:
+		msg = "error"
+	}
 	return &Response{
 		Ver:   EnvelopeVersion,
 		ReqID: reqID,

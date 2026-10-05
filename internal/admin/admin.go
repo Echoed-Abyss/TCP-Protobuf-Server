@@ -158,6 +158,7 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		//    immediately without comparing the token.
 		if s.isLockedOut(ip) {
 			protocol.GlobalMetrics.AdminRateLimited.Add(1)
+			s.failDelay()
 			http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
 			return
 		}
@@ -168,11 +169,7 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		if !authed {
 			protocol.GlobalMetrics.AdminAuthFail.Add(1)
 			s.recordAuthResult(ip, false)
-			// Constant artificial delay on auth failure to reduce timing
-			// side-channels that could distinguish wrong-token from
-			// lockout. 5ms is small enough not to enable DoS amplification
-			// but large enough to dominate comparison timing.
-			time.Sleep(5 * time.Millisecond)
+			s.failDelay()
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -185,7 +182,8 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		if r.Method == http.MethodPut || r.Method == http.MethodPost || r.Method == http.MethodDelete {
 			if r.Header.Get("X-Admin-Action") == "" {
 				protocol.GlobalMetrics.AdminAuthFail.Add(1)
-				http.Error(w, "missing X-Admin-Action header", http.StatusForbidden)
+				s.failDelay()
+				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
 		}
@@ -243,6 +241,13 @@ func (s *Server) recordAuthResult(ip string, ok bool) {
 func (s *Server) audit(action, detail string) {
 	fmt.Fprintf(os.Stderr, "[admin-audit] time=%s action=%s detail=%s\n",
 		time.Now().UTC().Format(time.RFC3339), action, detail)
+}
+
+// failDelay applies a constant artificial delay to all admin error
+// responses so that clients cannot distinguish failure modes (auth fail
+// vs config reject vs lockout) by response timing.
+func (s *Server) failDelay() {
+	time.Sleep(5 * time.Millisecond)
 }
 
 // extractToken reads the token from the Authorization header
@@ -329,8 +334,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := protocol.GlobalConfig.Apply(u); err != nil {
 			protocol.GlobalMetrics.AdminConfigReject.Add(1)
+			s.failDelay()
 			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"ok": "false", "code": "bad_request", "error": err.Error(),
+				"ok": "false", "code": "bad_request", "error": "request rejected",
 			})
 			return
 		}

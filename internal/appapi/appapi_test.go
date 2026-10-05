@@ -290,10 +290,22 @@ func TestWorkerBackpressure(t *testing.T) {
 	state := &connState{dedup: newDedupCache(8)}
 	// Occupy the single worker.
 	s.dispatch(nil, []byte(`{"ver":1,"req_id":"b1","action":"block","payload":{}}`), state)
-	<-started // wait for the worker to start
+	<-started // wait for the worker to start and hold the slot
 
-	// Verify the worker semaphore is full (non-blocking send fails),
-	// which is what dispatch checks before returning too_many_requests.
+	// Dispatch a second request while the pool is full. It must be
+	// rejected immediately (non-blocking) and increment AppWorkerReject.
+	before := protocol.GlobalMetrics.AppWorkerReject.Load()
+	s.dispatch(nil, []byte(`{"ver":1,"req_id":"b2","action":"block","payload":{}}`), state)
+
+	// Give the second goroutine a moment to run and be rejected.
+	time.Sleep(50 * time.Millisecond)
+	after := protocol.GlobalMetrics.AppWorkerReject.Load()
+	if after <= before {
+		t.Fatalf("expected AppWorkerReject to increase, before=%d after=%d", before, after)
+	}
+
+	// The worker semaphore must still be held by the first goroutine
+	// (the rejected dispatch did not consume a slot).
 	full := false
 	select {
 	case s.workers <- struct{}{}:
@@ -302,7 +314,7 @@ func TestWorkerBackpressure(t *testing.T) {
 		full = true
 	}
 	if !full {
-		t.Fatal("expected worker pool to be full")
+		t.Fatal("expected worker pool to remain full after rejected dispatch")
 	}
 
 	close(release)
