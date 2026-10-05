@@ -1,186 +1,166 @@
-# secproto — Secure TCP Protocol
+# secproto — 自定义 TCP 安全协议
 
-A custom TCP security protocol providing mutual authentication, forward
-secrecy, and traffic obfuscation for point-to-point connections. Built on
-standard cryptographic primitives (X25519, Ed25519, HKDF-SHA256,
-AES-256-GCM / ChaCha20-Poly1305) with no home-grown cryptography.
+一个自定义的 TCP 安全协议，为点对点连接提供双向认证、前向保密与流量混淆。
+底层完全基于标准密码学原语（X25519、Ed25519、HKDF-SHA256、AES-256-GCM /
+ChaCha20-Poly1305），不自行发明任何密码学算法。
 
-> **Security note.** This is an engineering exercise in protocol design.
-> It has not undergone a third-party audit. Do not use it to protect
-> classified, regulated, or high-value data without an independent review.
-> Prefer battle-tested transports (TLS 1.3, WireGuard, SSH) for production
-> use. See [PROTOCOL.md](PROTOCOL.md#known-security-boundaries) for the
-> explicit threat model and known limitations.
+> **安全声明。** 本项目是协议设计的工程实践。它**未经第三方审计**。
+> 在没有独立评审的情况下，请勿用它保护机密、受监管或高价值数据。
+> 生产环境请优先使用经过充分验证的传输层方案（TLS 1.3、WireGuard、SSH）。
+> 明确的威胁模型与已知边界见
+> [PROTOCOL.md](PROTOCOL.md#11-已知安全边界)。
 
-## Features
+## 特性
 
-- **Mutual authentication** via Ed25519 signatures over the handshake
-  transcript.
-- **Forward secrecy** via fresh X25519 ephemeral keys per handshake (and
-  per full re-handshake / renegotiation).
-- **AEAD encryption** (AES-256-GCM, with ChaCha20-Poly1305 fallback) with
-  per-direction keys and sequence numbers.
-- **Replay protection** using a sliding sequence-number window
-  (1024 entries) plus a timestamp time window.
-- **TOFU + pinning** trust store, with multi-key pinning for smooth
-  rotation and a CRL for revocation.
-- **Traffic obfuscation**: payload padding to 16-byte blocks and
-  periodic dummy/cover frames with jitter.
-- **Clock-offset negotiation** to reduce NTP dependency.
-- **Passphrase-encrypted identity keys** (scrypt + AES-256-GCM).
-- **Unified ambiguous errors** and constant failure delay so that
-  security-failure modes are indistinguishable externally.
-- **Passphrase-encrypted identity keys** at rest (scrypt + AES-256-GCM).
+- **双向认证**：握手报文采用 Ed25519 签名，绑定完整握手转录。
+- **前向保密（PFS）**：每次握手（以及每次全量重协商）使用全新的 X25519 临时密钥。
+- **AEAD 加密**：默认 AES-256-GCM，回退 ChaCha20-Poly1305；每方向独立密钥与序列号。
+- **重放防护**：1024 项的序列号滑动窗口 + 时间戳时间窗口，双重校验。
+- **TOFU + 公钥固定（pinning）**：支持多公钥固定以平滑轮换，并内置 CRL 吊销列表。
+- **流量混淆**：载荷填充到 16 字节块，并按抖动发送周期性 dummy/cover 帧。
+- **时钟偏移协商**：握手交换时间戳，降低对 NTP 的强依赖。
+- **口令加密身份密钥**：scrypt + AES-256-GCM 包裹 Ed25519 seed，私钥明文不落盘。
+- **统一模糊错误**：所有失败对外返回同一错误，并施加恒定延迟，使失败模式不可区分。
 
-## Repository layout
+## 仓库结构
 
 ```
-cmd/secproto/          CLI entry point (genkey | server | client)
-internal/crypto/       AEAD ciphers, X25519/Ed25519 keys, HKDF, keyfile
-internal/proto/secpb/  Generated protobuf for handshake messages
-internal/protocol/     Frame format, constants, errors, metrics, padding
-internal/session/      Per-connection crypto state + replay window
-internal/transport/    Conn, handshake, rekey, renegotiation, read loop
-internal/trust/        TOFU / multi-pin / CRL trust store
-proto/                 Protobuf source
-tests/                 Python black-box test suite (T1–T13)
+cmd/secproto/          CLI 入口（genkey | server | client）
+internal/crypto/       AEAD 密码、X25519/Ed25519 密钥、HKDF、密钥文件
+internal/proto/secpb/  握手消息的 protobuf 生成代码
+internal/protocol/     帧格式、常量、错误、指标、填充
+internal/session/      单连接密码状态 + 重放窗口
+internal/transport/    Conn、握手、rekey、重协商、读循环
+internal/trust/        TOFU / 多公钥固定 / CRL 信任存储
+proto/                 protobuf 源文件
+tests/                 Python 黑盒测试套件（T1–T13）
 ```
 
-## Build
+## 构建
 
-Requires Go 1.22+ (the `go.mod` declares 1.26; the code uses only stable
-stdlib + `golang.org/x/crypto`).
+需要 Go 1.22+（`go.mod` 声明为 1.26；代码仅使用稳定版标准库 +
+`golang.org/x/crypto`）。
 
 ```sh
-# Host build
+# 本机构建
 make build
 
-# Static Linux amd64 binary (for release / containers)
+# 静态 Linux amd64 二进制（用于发布 / 容器）
 make build-linux          # -> build/secproto-linux-amd64
 
-# Cross-compile examples
+# 交叉编译示例
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
     -o build/secproto-linux-arm64 ./cmd/secproto
 GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
     -o build/secproto-darwin-arm64 ./cmd/secproto
 
-# Vendored / offline build
+# vendor / 离线构建
 make vendor
 CGO_ENABLED=0 go build -mod=vendor -trimpath -ldflags="-s -w" \
     -o build/secproto ./cmd/secproto
 ```
 
-## Quick start
+## 快速开始
 
 ```sh
-# 1. Generate a passphrase-encrypted identity key.
+# 1. 生成经口令加密的身份密钥
 export SECPROTO_PASSPHRASE='correct-horse-battery-staple'
 ./build/secproto-linux-amd64 -role genkey -key /tmp/server.key
 ./build/secproto-linux-amd64 -role genkey -key /tmp/client.key
 
-# 2. Start the server (echoes received data).
+# 2. 启动服务端（回显收到的数据）
 ./build/secproto-linux-amd64 -role server -key /tmp/server.key \
     -addr 127.0.0.1:8443
 
-# 3. Run the client (pin the server's public key).
+# 3. 运行客户端（固定服务端公钥）
 ./build/secproto-linux-amd64 -role client -key /tmp/client.key \
     -addr 127.0.0.1:8443 \
-    -peer-pub <server-pubkey-hex-from-step-2>
+    -peer-pub <第 2 步打印的服务端公钥 hex>
 ```
 
-## Configuration
+## 配置项
 
-All options can be set via environment variables or CLI flags (flags take
-precedence for non-passphrase values; the passphrase env var is preferred
-over the flag for security).
+所有选项都可经环境变量或命令行 flag 设置。对非口令项，flag 优先；对
+口令，环境变量优先级高于 flag（更安全）。
 
-| CLI flag           | Env var              | Default          | Description                                           |
-|--------------------|----------------------|------------------|-------------------------------------------------------|
-| `-role`            | `SECPROTO_ROLE`      | _(required)_     | `genkey` \| `server` \| `client`                      |
-| `-addr`            | `SECPROTO_ADDR`      | `127.0.0.1:8443` | Listen (server) or dial (client) address              |
-| `-key`             | `SECPROTO_KEY`       | _(required)_     | Path to the identity key file                         |
-| `-peer-pub`        | `SECPROTO_PEER_PUB`  | _(empty)_        | Comma-separated peer Ed25519 public keys (hex) to pin |
-| `-revoke`          | `SECPROTO_REVOKE`    | _(empty)_        | Comma-separated revoked public keys (hex) — CRL       |
-| `-trust-store`     | `SECPROTO_TRUST_STORE` | _(empty)_      | Path to the TOFU trust-store file                     |
-| `-passphrase`      | —                    | _(empty)_        | Identity-key passphrase (insecure; use env var)       |
-| —                  | `SECPROTO_PASSPHRASE`| _(empty)_        | Identity-key passphrase (preferred)                   |
+| CLI flag           | 环境变量             | 默认值           | 说明                                                   |
+|--------------------|----------------------|------------------|--------------------------------------------------------|
+| `-role`            | `SECPROTO_ROLE`      | _（必填）_       | `genkey` \| `server` \| `client`                        |
+| `-addr`            | `SECPROTO_ADDR`      | `127.0.0.1:8443` | 监听（server）或拨号（client）地址                      |
+| `-key`             | `SECPROTO_KEY`       | _（必填）_       | 身份密钥文件路径                                        |
+| `-peer-pub`        | `SECPROTO_PEER_PUB`  | _（空）_         | 逗号分隔的对端 Ed25519 公钥（hex），用于固定           |
+| `-revoke`          | `SECPROTO_REVOKE`    | _（空）_         | 逗号分隔的已吊销公钥（hex）——CRL                        |
+| `-trust-store`     | `SECPROTO_TRUST_STORE` | _（空）_       | TOFU 信任存储文件路径                                   |
+| `-passphrase`      | —                    | _（空）_         | 身份密钥口令（不安全；建议用环境变量）                  |
+| —                  | `SECPROTO_PASSPHRASE`| _（空）_         | 身份密钥口令（推荐）                                    |
 
-Additional tunables are compiled-in constants in
-[`internal/protocol/constants.go`](internal/protocol/constants.go):
+其他可调参数是
+[`internal/protocol/constants.go`](internal/protocol/constants.go)
+中的编译期常量：
 
-| Constant                   | Default       | Meaning                                          |
+| 常量                       | 默认值        | 含义                                             |
 |----------------------------|---------------|--------------------------------------------------|
-| `ProtocolVersion`          | `1`           | Wire protocol version                            |
-| `MinSupportedVersion`      | `1`           | Lowest accepted version                          |
-| `HeaderSize`               | `37`          | Fixed frame-header length (bytes)               |
-| `MaxFramePayload`          | `16 MiB`      | Maximum payload per frame                        |
-| `HandshakeTimeWindow`      | `30 s`        | Clock-skew tolerance for handshake frames        |
-| `DataTimeWindow`           | `60 s`        | Clock-skew tolerance for data frames             |
-| `ReplayWindowSize`         | `1024`        | Sliding replay-window size                       |
-| `HeartbeatInterval`        | `15 s`        | Heartbeat frame interval                         |
-| `SessionKeyTTL`            | `1 h`         | Session-key lifetime (triggers PFS reneg.)       |
-| `MaxKeyID`                 | `250`         | Highest `key_id` before forced renegotiation     |
-| `PaddingBlockSize`         | `16`          | Payload padding block size (`0` disables)        |
-| `MaxPaddingSize`           | `1024`        | Maximum padding overhead per frame               |
-| `DummyFrameInterval`       | `10 s`        | Base interval for dummy/cover frames             |
-| `DummyFrameJitter`         | `±3 s`        | Random jitter applied to the dummy interval      |
-| `DefaultDummyPayloadSize`  | `64`          | Payload size of dummy frames                     |
-| `MaxClockOffset`           | `5 min`       | Maximum clock offset compensated for             |
-| `ForceRenegotiateInterval` | `1 h`         | Interval that forces a full PFS re-handshake     |
+| `ProtocolVersion`          | `1`           | 线路协议版本                                     |
+| `MinSupportedVersion`      | `1`           | 可接受的最低版本                                 |
+| `HeaderSize`               | `37`          | 固定帧头长度（字节）                             |
+| `MaxFramePayload`          | `16 MiB`      | 单帧最大载荷                                     |
+| `HandshakeTimeWindow`      | `30 s`        | 握手帧的时钟偏移容忍                             |
+| `DataTimeWindow`           | `60 s`        | 数据帧的时钟偏移容忍                             |
+| `ReplayWindowSize`         | `1024`        | 滑动重放窗口大小                                 |
+| `HeartbeatInterval`        | `15 s`        | 心跳帧间隔                                       |
+| `SessionKeyTTL`            | `1 h`         | 会话密钥生命周期（触发 PFS 重协商）              |
+| `MaxKeyID`                 | `250`         | 强制重协商前的 `key_id` 上限                     |
+| `PaddingBlockSize`         | `16`          | 载荷填充块大小（`0` 关闭）                       |
+| `MaxPaddingSize`           | `1024`        | 单帧最大填充开销                                 |
+| `DummyFrameInterval`       | `10 s`        | dummy/cover 帧的基础间隔                         |
+| `DummyFrameJitter`         | `±3 s`        | 施加于 dummy 间隔的随机抖动                      |
+| `DefaultDummyPayloadSize`  | `64`          | dummy 帧载荷大小                                 |
+| `MaxClockOffset`           | `5 min`       | 允许补偿的最大时钟偏移                           |
+| `ForceRenegotiateInterval` | `1 h`         | 强制全量 PFS 重握手的间隔                        |
 
-### Identity key files
+### 身份密钥文件
 
-- **Encrypted (recommended):** `scrypt(N=32768, r=8, p=1)` derives a
-  32-byte AES key from the passphrase and a 16-byte random salt; the
-  32-byte Ed25519 seed is wrapped with AES-256-GCM (12-byte nonce).
-  File layout: `[salt 16][nonce 12][ciphertext+tag 48]`.
-- **Legacy unencrypted:** a raw 32-byte Ed25519 seed. Kept only for
-  backward compatibility; `genkey` prints a warning when the passphrase
-  is empty, and loading an encrypted key without a passphrase fails.
+- **加密存储（推荐）：** `scrypt(N=32768, r=8, p=1)` 从口令与 16 字节随机盐
+  派生出 32 字节 AES 密钥；用 AES-256-GCM（12 字节 nonce）包裹 32 字节
+  Ed25519 seed。文件布局：`[salt 16][nonce 12][ciphertext+tag 48]`。
+- **旧版明文：** 原始 32 字节 Ed25519 seed。仅为向后兼容保留；当口令为空时
+  `genkey` 会打印告警；用无口令方式加载加密密钥文件会直接失败。
 
-## Key rotation & revocation
+## 密钥轮换与吊销
 
-- **In-band rekey** (`MsgTypeRekey`): derives new traffic keys from
-  `HKDF(old_traffic_secret || new_random)`. Fast and lightweight, but
-  **not forward-secret** — compromise of the old traffic secret reveals
-  all subsequent in-band keys. Used for nonce-space / key-lifetime
-  management within a session.
-- **Full renegotiation** (`MsgTypeReneg*`): a fresh X25519 exchange
-  carried inside the encrypted session. The new keys are independent of
-  the old session, so compromise of the old key does **not** reveal new
-  traffic. This is the only PFS-preserving rotation path. It is triggered
-  automatically when `key_id` reaches `MaxKeyID` or when the session key
-  exceeds `SessionKeyTTL` (default 1 h).
-- **Multi-pin:** `-peer-pub` accepts a comma-separated list. Both old and
-  new keys are accepted during a rotation window.
-- **CRL:** `-revoke` accepts a comma-separated list of public keys that
-  are always rejected, regardless of pinning or TOFU.
+- **带内 rekey**（`MsgTypeRekey`）：由
+  `HKDF(old_traffic_secret || new_random)` 派生新的流量密钥。快速轻量，但
+  **不提供前向保密**——旧流量密钥一旦泄露，可推导后续所有带内密钥。仅用于
+  会话内的 nonce 空间 / 密钥生命周期管理。
+- **全量重协商**（`MsgTypeReneg*`）：在加密会话内进行全新的 X25519 交换，
+  新密钥与旧会话无关，因此旧密钥泄露**不会**暴露新流量。这是唯一满足 PFS 的
+  轮换路径。当 `key_id` 达到 `MaxKeyID`，或会话密钥超过 `SessionKeyTTL`
+  （默认 1 小时）时自动触发。
+- **多公钥固定：** `-peer-pub` 接受逗号分隔的列表，轮换窗口内新旧密钥均被接受。
+- **CRL：** `-revoke` 接受逗号分隔的公钥列表，无论固定或 TOFU 状态如何，
+  这些密钥一律被拒绝。
 
-Runbook for a smooth identity-key rotation:
+平滑轮换身份密钥的操作手册：
 
-1. Generate the new identity key (`genkey`).
-2. Add the new public key to the peer's `-peer-pub` list (keep the old
-   one).
-3. Restart the peer.
-4. Switch the local identity to the new key and restart.
-5. Remove the old public key from the peer's `-peer-pub` list and
-   optionally add it to `-revoke`.
+1. 生成新的身份密钥（`genkey`）。
+2. 把新公钥加入对端的 `-peer-pub` 列表（保留旧公钥）。
+3. 重启对端。
+4. 将本端身份切换为新密钥并重启。
+5. 从对端的 `-peer-pub` 列表移除旧公钥，并（可选）加入 `-revoke`。
 
-## Testing
+## 测试
 
-### Go unit tests
+### Go 单元测试
 
 ```sh
 make test          # go test ./... -v
 make vet           # go vet ./...
 ```
 
-### Python black-box tests (T1–T13)
+### Python 黑盒测试（T1–T13）
 
-The Python suite speaks the wire protocol directly and exercises
-handshake, tampering, replay, expiry, MITM, nonce reuse, concurrency,
-reconnect, PFS renegotiation, padding, passphrase keys, clock offset,
-and CRL/multi-pin.
+Python 套件直接以线路协议通信，覆盖：握手、篡改、重放、过期、MITM、
+nonce 复用、并发、重连、PFS 重协商、填充、口令密钥、时钟偏移、CRL/多公钥。
 
 ```sh
 pip install -r tests/requirements.txt
@@ -188,9 +168,9 @@ export SECPROTO_BIN=./build/secproto-linux-amd64
 python3 tests/secproto_test.py
 ```
 
-Expected output: `RESULTS: 13/13 tests passed`.
+预期输出：`RESULTS: 13/13 tests passed`。
 
-## Cross-compilation matrix (reference)
+## 交叉编译矩阵（参考）
 
 ```sh
 for os in linux darwin windows; do
@@ -202,6 +182,6 @@ for os in linux darwin windows; do
 done
 ```
 
-## License
+## 许可
 
-Internal engineering artifact. No public license granted.
+内部工程产物。未授予公开许可证。
