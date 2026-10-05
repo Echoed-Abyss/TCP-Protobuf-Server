@@ -1,0 +1,22 @@
+# Build artifacts
+secproto-linux-amd64
+*.exe
+*.out
+
+# Identity keys / secrets (NEVER commit)
+*.key
+*.pem
+*.der
+*.seed
+secrets/
+
+# Go
+/vendor/
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Python
+__pycache__/
+*.pyc

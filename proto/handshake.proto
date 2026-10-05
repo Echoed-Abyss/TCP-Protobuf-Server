@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package secproto.v1;
+
+option go_package = "github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/proto/secpb;secpb";
+
+// Cipher suite identifiers negotiated during handshake.
+enum CipherSuite {
+  CIPHER_SUITE_UNSPECIFIED = 0;
+  CIPHER_SUITE_AES_256_GCM = 1;
+  CIPHER_SUITE_CHACHA20_POLY1305 = 2;
+}
+
+// Client -> Server (plaintext). Initiates the handshake.
+message ClientHello {
+  uint32 version = 1;
+  repeated CipherSuite cipher_suites = 2;
+  bytes client_random = 3;           // 32 bytes high-entropy
+  bytes client_ephemeral_pubkey = 4; // 32 bytes X25519
+  bytes client_identity_pubkey = 5;  // 32 bytes Ed25519 (long-term identity)
+  bytes auth_token = 6;              // optional PSK/token
+  int64 client_time = 7;             // Unix nanoseconds, for clock offset estimation
+}
+
+// Server -> Client (plaintext). Server's ephemeral key and selected suite.
+message ServerHello {
+  uint32 version = 1;
+  CipherSuite cipher_suite = 2;
+  bytes server_random = 3;            // 32 bytes high-entropy
+  bytes server_ephemeral_pubkey = 4;  // 32 bytes X25519
+  bytes server_identity_pubkey = 5;   // 32 bytes Ed25519
+  int64 server_time = 6;              // Unix nanoseconds, for clock offset estimation
+}
+
+// Server -> Client (plaintext). Signature binds the handshake transcript.
+message ServerProof {
+  bytes signature = 1; // Ed25519 over transcript of ClientHello || ServerHello
+}
+
+// Client -> Server (encrypted). Proves client identity and binds transcript.
+message ClientFinished {
+  bytes signature = 1; // Ed25519 over transcript of ClientHello || ServerHello || ServerProof
+}
+
+// Server -> Client (encrypted). Final confirmation.
+message ServerFinished {
+  bool success = 1;
+}
+
+// Either direction (encrypted). Triggers key rotation.
+message Rekey {
+  uint32 new_key_id = 1;
+  bytes new_ephemeral_pubkey = 2; // 32 bytes X25519
+  bytes new_random = 3;           // 32 bytes
+}
+
+// Either direction (encrypted). Application payload.
+message AppData {
+  bytes data = 1;
+}
