@@ -57,7 +57,7 @@ func (c *Conn) dispatchFrame(f *protocol.Frame, sess *session.Session) error {
 		protocol.GlobalMetrics.ReplayRejected.Add(1)
 		return protocol.ErrReplay
 	}
-	if !c.checkTimeWindow(f, time.Duration(protocol.DataTimeWindow)) {
+	if !c.checkTimeWindow(f, dataTimeWindow()) {
 		protocol.GlobalMetrics.ExpiredRejected.Add(1)
 		return protocol.ErrExpired
 	}
@@ -115,7 +115,7 @@ func (c *Conn) startHeartbeat() {
 
 func (c *Conn) heartbeatLoop() {
 	defer c.heartbeatWg.Done()
-	hbTicker := time.NewTicker(time.Duration(protocol.HeartbeatInterval))
+	hbTicker := time.NewTicker(heartbeatInterval())
 	defer hbTicker.Stop()
 
 	dummyTimer := time.NewTimer(c.nextDummyDelay())
@@ -126,6 +126,8 @@ func (c *Conn) heartbeatLoop() {
 		case <-c.heartbeatStop:
 			return
 		case <-hbTicker.C:
+			// Re-create ticker with the (possibly hot-changed) interval.
+			hbTicker.Reset(heartbeatInterval())
 			// Check session key TTL; trigger full renegotiation (PFS)
 			// when expired. Full renegotiation uses fresh X25519 keys so
 			// the new session is forward-secret.
@@ -138,6 +140,7 @@ func (c *Conn) heartbeatLoop() {
 					c.Close()
 					return
 				}
+				protocol.GlobalMetrics.Renegotiations.Add(1)
 				continue
 			}
 			// Send heartbeat.
@@ -147,21 +150,29 @@ func (c *Conn) heartbeatLoop() {
 			}
 		case <-dummyTimer.C:
 			// Send a dummy/cover frame to obfuscate traffic timing.
-			if err := c.sendDummyFrame(); err != nil {
-				c.Close()
-				return
+			// Skipped if dummy frames are disabled at runtime.
+			if protocol.GlobalConfig.DummyFramesEnabled.Load() {
+				if err := c.sendDummyFrame(); err != nil {
+					c.Close()
+					return
+				}
 			}
 			dummyTimer.Reset(c.nextDummyDelay())
 		}
 	}
 }
 
+// heartbeatInterval returns the current heartbeat interval (runtime-configurable).
+func heartbeatInterval() time.Duration {
+	return time.Duration(protocol.GlobalConfig.HeartbeatInterval.Load())
+}
+
 // nextDummyDelay returns a randomized delay for the next dummy frame.
 // Base interval ± jitter, clamped to >= 1ms.
 func (c *Conn) nextDummyDelay() time.Duration {
-	base := protocol.DummyFrameInterval
-	jitter := protocol.DummyFrameJitter
-	if base == 0 {
+	base := protocol.GlobalConfig.DummyFrameInterval.Load()
+	jitter := protocol.GlobalConfig.DummyFrameJitter.Load()
+	if base == 0 || !protocol.GlobalConfig.DummyFramesEnabled.Load() {
 		// Dummy frames disabled; return a very long duration.
 		return time.Duration(1<<63 - 1)
 	}
@@ -177,6 +188,7 @@ func (c *Conn) nextDummyDelay() time.Duration {
 // sendDummyFrame sends a cover-traffic frame with random payload.
 func (c *Conn) sendDummyFrame() error {
 	payload := randomBytes(protocol.DefaultDummyPayloadSize)
+	protocol.GlobalMetrics.DummyFramesSent.Add(1)
 	return c.writeEncrypted(protocol.MsgTypeDummy, payload)
 }
 

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/admin"
+	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/appapi"
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/client"
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/crypto"
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/protocol"
@@ -33,6 +35,10 @@ type Config struct {
 	SessionTTL    time.Duration
 	HeartbeatInt  time.Duration
 	TimestampWin  time.Duration
+
+	// Admin management plane (localhost + token only).
+	AdminBind  string // e.g. 127.0.0.1:9090
+	AdminToken string // bearer token for admin endpoints
 }
 
 func main() {
@@ -82,6 +88,8 @@ func loadConfig() *Config {
 	flag.StringVar(&cfg.RevokeHex, "revoke", envOr("SECPROTO_REVOKE", ""), "comma-separated revoked public keys (hex) for CRL")
 	flag.StringVar(&cfg.TrustStore, "trust-store", envOr("SECPROTO_TRUST_STORE", ""), "path to TOFU trust store file")
 	flag.StringVar(&cfg.Passphrase, "passphrase", "", "identity key passphrase (insecure; prefer SECPROTO_PASSPHRASE)")
+	flag.StringVar(&cfg.AdminBind, "admin-bind", envOr("SECPROTO_ADMIN_BIND", "127.0.0.1:9090"), "admin HTTP bind address (loopback only)")
+	flag.StringVar(&cfg.AdminToken, "admin-token", envOr("SECPROTO_ADMIN_TOKEN", ""), "admin bearer token (required if admin enabled)")
 	cfg.PassphraseEnv = os.Getenv("SECPROTO_PASSPHRASE")
 	flag.Parse()
 	return cfg
@@ -215,6 +223,15 @@ func runServer(cfg *Config) error {
 
 	srv := server.NewServer(id)
 
+	// Application-layer API: registers built-in demo actions (echo,
+	// server.stats, kv.set, kv.get) and serves requests over the encrypted
+	// transport. Business JSON never leaves the AEAD channel.
+	appSrv := appapi.NewServer(appapi.NewRegistry(), 0)
+	appSrv.RegisterDefaults()
+	// ServeConn blocks (drives the read loop and drains in-flight requests
+	// on close); the server's own ReadLoop call becomes a no-op.
+	srv.OnConn = func(c *transport.Conn) { _ = appSrv.ServeConn(c) }
+
 	// Configure trust: pinned peer keys (multi-pin) and CRL.
 	pinnedKeys, err := parseHexList(cfg.PeerPubHex)
 	if err != nil {
@@ -249,11 +266,43 @@ func runServer(cfg *Config) error {
 		}
 	}
 
-	srv.OnConn = func(c *transport.Conn) {
-		c.SetOnData(func(data []byte) {
-			_ = c.SendData(data) // echo
+	// Admin management plane (localhost + token only). Started only when a
+	// token is configured.
+	if cfg.AdminToken != "" {
+		static := admin.StaticConfig{
+			ListenAddr:   cfg.Addr,
+			KeyFile:      cfg.KeyFile,
+			TrustStore:   cfg.TrustStore,
+			SessionTTLNs: protocol.SessionKeyTTL,
+			MaxKeyID:     protocol.MaxKeyID,
+			ProtocolVer:  protocol.ProtocolVersion,
+		}
+		adm, err := admin.New(cfg.AdminBind, cfg.AdminToken, srv, static)
+		if err != nil {
+			return fmt.Errorf("admin init: %w", err)
+		}
+		// Health self-check: key file should not be world-readable.
+		adm.SetHealthCheck(func() error {
+			info, statErr := os.Stat(cfg.KeyFile)
+			if statErr != nil {
+				return statErr
+			}
+			if info.Mode().Perm()&0o077 != 0 {
+				return fmt.Errorf("key file %q is group/world-readable (mode %o)",
+					cfg.KeyFile, info.Mode().Perm())
+			}
+			return nil
 		})
+		go func() {
+			if serveErr := adm.ListenAndServe(); serveErr != nil {
+				fmt.Fprintf(os.Stderr, "admin server stopped: %v\n", serveErr)
+			}
+		}()
+		fmt.Printf("admin UI: http://%s/admin/ (token required)\n", cfg.AdminBind)
+	} else {
+		fmt.Println("admin disabled (set -admin-token or SECPROTO_ADMIN_TOKEN to enable)")
 	}
+
 	if err := srv.Listen(cfg.Addr); err != nil {
 		return err
 	}

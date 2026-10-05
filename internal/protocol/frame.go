@@ -109,7 +109,7 @@ func ParseHeader(r io.Reader) (*Frame, uint32, error) {
 	seq := binary.BigEndian.Uint64(hdr[5:13])
 	payloadLen := binary.BigEndian.Uint32(hdr[33:37])
 	if payloadLen > MaxFramePayload {
-		GlobalMetrics.InvalidFrame.Add(1)
+		GlobalMetrics.OversizedFrame.Add(1)
 		return nil, 0, ErrInvalidFrame
 	}
 	f := &Frame{
