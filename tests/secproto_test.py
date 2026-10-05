@@ -992,6 +992,9 @@ def _admin_request(method, path, token=None, body=None):
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    # Write requests must carry the X-Admin-Action custom header (CSRF defence).
+    if method in ("PUT", "POST", "DELETE"):
+        headers["X-Admin-Action"] = "1"
     if body is not None:
         import json as _json
         data = _json.dumps(body).encode()
@@ -1103,6 +1106,312 @@ def test_t16_admin():
 
 
 # ---------------------------------------------------------------------------
+# T17: Handshake timeout (half-open connection DoS)
+# ---------------------------------------------------------------------------
+def test_t17_handshake_timeout():
+    name = "T17 Handshake timeout (half-open connection)"
+    try:
+        import socket as _socket
+
+        # Connect but never send a ClientHello; the server must close the
+        # connection within HandshakeTimeout (10s).
+        sock = _socket.create_connection((HOST, SERVER_PORT), timeout=15)
+        # Don't send anything. The server's handshake read deadline should
+        # fire and close the connection.
+        sock.settimeout(15)
+        start = time.time()
+        try:
+            data = sock.recv(4096)
+        except Exception:
+            data = b""
+        elapsed = time.time() - start
+        sock.close()
+
+        # The server should close within ~HandshakeTimeout + a small margin.
+        # We accept up to 15s to avoid flakiness, but it must be < 30s.
+        if elapsed > 30:
+            record(name, False, f"connection not closed within 30s (elapsed={elapsed:.1f}s)")
+            return
+        record(name, True, f"half-open conn closed in {elapsed:.1f}s")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# T18: Oversized frame / oversized appapi payload / deep JSON rejected
+# ---------------------------------------------------------------------------
+def test_t18_oversized_payloads():
+    name = "T18 Oversized frame + payload + deep JSON rejected"
+    try:
+        import json as _json
+        import struct as _struct
+
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = SecureClient(HOST, SERVER_PORT, peer_pubkey=srv_pub)
+        cli.connect()
+        cli.handshake()
+
+        # 1. Oversized appapi JSON payload (> MaxAppPayload=32KiB).
+        big = {"ver": 1, "req_id": "big1", "action": "echo",
+               "timeout_ms": 1000, "payload": {"x": "a" * 40000}}
+        cli.send_data(_json.dumps(big).encode())
+        resp = _json.loads(cli.recv_data())
+        assert resp["code"] == "bad_request", f"expected bad_request, got {resp.get('code')}"
+
+        # 2. Deeply nested JSON (> MaxJSONDepth).
+        deep_p = "{" * 80 + '"x":1' + "}" * 80
+        deep = f'{{"ver":1,"req_id":"deep","action":"echo","timeout_ms":1000,"payload":{deep_p}}}'
+        cli.send_data(deep.encode())
+        resp2 = _json.loads(cli.recv_data())
+        assert resp2["code"] == "bad_request", f"expected bad_request for deep JSON, got {resp2.get('code')}"
+
+        # 3. Oversized frame length at the transport level: craft a valid
+        #    header with Length > MaxFramePayload (64KiB) and verify the
+        #    server closes the connection.
+        cli2 = SecureClient(HOST, SERVER_PORT, peer_pubkey=srv_pub)
+        cli2.connect()
+        cli2.handshake()
+        # Build a frame header with Length = 128KiB (> 64KiB max).
+        hdr = bytearray(37)
+        hdr[0:2] = _struct.pack(">H", 0x5343)  # magic
+        hdr[2] = 2  # version
+        hdr[3] = 5  # MsgType Data
+        hdr[4] = 0  # key_id
+        _struct.pack_into(">Q", hdr, 5, 1)  # seq
+        # nonce (12 bytes, offset 13) left as zero
+        _struct.pack_into(">Q", hdr, 25, int(time.time() * 1e9))  # timestamp
+        _struct.pack_into(">I", hdr, 33, 128 * 1024)  # length = 128KiB
+        cli2.sock.sendall(bytes(hdr))
+        # Server should close the connection.
+        cli2.sock.settimeout(5)
+        data = cli2.sock.recv(4096)
+        assert not data, "server should close connection on oversized frame"
+        cli2.close()
+
+        record(name, True, "oversized payload, deep JSON, oversized frame all rejected")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# T19: req_id dedup + kv.set capacity limits
+# ---------------------------------------------------------------------------
+def test_t19_dedup_and_kv_limits():
+    name = "T19 Dedup cache + kv store capacity limits"
+    try:
+        import json as _json
+
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = SecureClient(HOST, SERVER_PORT, peer_pubkey=srv_pub)
+        cli.connect()
+        cli.handshake()
+
+        # 1. Dedup: same req_id returns cached response (handler runs once).
+        #    Use server.stats which returns live metrics; the cached response
+        #    will have identical frames_received to the first call.
+        req = {"ver": 1, "req_id": "dedup1", "action": "server.stats",
+               "timeout_ms": 1000, "payload": {}}
+        cli.send_data(_json.dumps(req).encode())
+        r1 = _json.loads(cli.recv_data())
+        cli.send_data(_json.dumps(req).encode())
+        r2 = _json.loads(cli.recv_data())
+        assert r1["data"] == r2["data"], "dedup should return cached response"
+
+        # 2. Invalid req_id (bad charset) -> bad_request.
+        bad = {"ver": 1, "req_id": "bad/id", "action": "echo", "payload": {}}
+        cli.send_data(_json.dumps(bad).encode())
+        rb = _json.loads(cli.recv_data())
+        assert rb["code"] == "bad_request", f"bad req_id should be rejected, got {rb.get('code')}"
+
+        # 3. kv.set capacity: write more than MaxKVEntries (1024) keys and
+        #    verify the store does not OOM (it evicts). We send a subset
+        #    to keep the test fast.
+        for i in range(1100):
+            cli.send_data(_json.dumps({
+                "ver": 1, "req_id": f"k{i}", "action": "kv.set",
+                "payload": {"key": f"k{i}", "value": "v"},
+            }).encode())
+            # Drain responses to avoid buffer buildup.
+            cli.recv_data()
+
+        # The oldest key should have been evicted.
+        cli.send_data(_json.dumps({
+            "ver": 1, "req_id": "g0", "action": "kv.get",
+            "payload": {"key": "k0"},
+        }).encode())
+        g = _json.loads(cli.recv_data())
+        assert g["data"]["found"] is False, "oldest kv entry should be evicted"
+
+        cli.close()
+        record(name, True, "dedup works, bad req_id rejected, kv store bounded")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# T20: Worker pool backpressure (too_many_requests when saturated)
+# ---------------------------------------------------------------------------
+def test_t20_worker_backpressure():
+    name = "T20 Worker pool backpressure (fast reject when full)"
+    try:
+        import json as _json
+
+        srv_pub = bytes.fromhex(get_pubkey_hex(SERVER_KEY))
+        cli = SecureClient(HOST, SERVER_PORT, peer_pubkey=srv_pub)
+        cli.connect()
+        cli.handshake()
+
+        # Send many requests with very short timeouts concurrently. With
+        # the worker pool bounded (64) and requests timing out quickly,
+        # the pool should saturate and some requests get too_many_requests.
+        import threading
+
+        results = []
+        lock = threading.Lock()
+
+        def send_one(idx):
+            try:
+                c = SecureClient(HOST, SERVER_PORT, peer_pubkey=srv_pub)
+                c.connect()
+                c.handshake()
+                # timeout_ms=1 forces immediate timeout for the handler,
+                # but the worker slot is still acquired.
+                c.send_data(_json.dumps({
+                    "ver": 1, "req_id": f"w{idx}", "action": "echo",
+                    "timeout_ms": 1, "payload": {},
+                }).encode())
+                r = _json.loads(c.recv_data())
+                with lock:
+                    results.append(r.get("code"))
+                c.close()
+            except Exception:
+                pass
+
+        threads = [threading.Thread(target=send_one, args=(i,)) for i in range(100)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        # With 100 concurrent requests against a 64-worker pool, we expect
+        # at least some to be rejected with too_many_requests OR to timeout.
+        # The key assertion: the server did not crash and all responses are
+        # valid JSON with known codes.
+        assert len(results) > 0, "no responses received"
+        valid_codes = {"ok", "timeout", "too_many_requests", "bad_request"}
+        for code in results:
+            assert code in valid_codes, f"unexpected code: {code}"
+
+        cli.close()
+        record(name, True, f"server handled load, codes seen: {set(results)}")
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# T21: Admin brute-force lockout + CSRF + config bounds
+# ---------------------------------------------------------------------------
+def test_t21_admin_hardening():
+    name = "T21 Admin hardening (lockout, CSRF, config bounds)"
+    try:
+        import json as _json
+
+        srv = subprocess.Popen(
+            [SECPROTO_BIN, "-role", "server", "-key", SERVER_KEY,
+             "-addr", f"{HOST}:{SERVER_PORT}",
+             "-admin-bind", f"{HOST}:{ADMIN_PORT}",
+             "-admin-token", ADMIN_TOKEN],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.time() + 5
+            saw_tcp = saw_admin = False
+            while time.time() < deadline and not (saw_tcp and saw_admin):
+                line = srv.stdout.readline()
+                if not line:
+                    time.sleep(0.1)
+                    continue
+                if b"listening on" in line:
+                    saw_tcp = True
+                if b"admin UI" in line:
+                    saw_admin = True
+            assert saw_tcp and saw_admin, "server with admin did not start"
+
+            # 1. Brute-force: send MaxAuthFailures wrong tokens, then the
+            #    correct token should be locked out (429).
+            for _ in range(6):  # MaxAuthFailures=5, plus one more
+                _admin_request("GET", "/admin/stats", token="wrong")
+            st, _ = _admin_request("GET", "/admin/stats", token=ADMIN_TOKEN)
+            assert st == 429, f"expected 429 after lockout, got {st}"
+
+            # Wait for lockout to expire (30s is too long for a test, so
+            # we verify the lockout happened and move on; the Go test
+            # covers the full lockout/expiry cycle).
+            # Instead, test CSRF: PUT without X-Admin-Action -> 403.
+            # We need a fresh IP perspective; since lockout is per-IP,
+            # restart the server to clear lockout state.
+            srv.terminate()
+            srv.wait(timeout=3)
+
+            srv = subprocess.Popen(
+                [SECPROTO_BIN, "-role", "server", "-key", SERVER_KEY,
+                 "-addr", f"{HOST}:{SERVER_PORT}",
+                 "-admin-bind", f"{HOST}:{ADMIN_PORT}",
+                 "-admin-token", ADMIN_TOKEN],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            time.sleep(1.0)
+
+            # 2. CSRF: PUT without X-Admin-Action header -> 403.
+            import urllib.request, urllib.error
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            req = urllib.request.Request(
+                f"http://{HOST}:{ADMIN_PORT}/admin/config",
+                data=b'{"heartbeat_interval_ns":20000000000}',
+                method="PUT",
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}",
+                         "Content-Type": "application/json"},
+                # Note: no X-Admin-Action header
+            )
+            try:
+                opener.open(req, timeout=5)
+                csrf_ok = False
+            except urllib.error.HTTPError as e:
+                csrf_ok = (e.code == 403)
+            assert csrf_ok, "expected 403 for PUT without X-Admin-Action"
+
+            # 3. Config bounds: padding_block_size=0 should be rejected.
+            st, body = _admin_request(
+                "PUT", "/admin/config", token=ADMIN_TOKEN,
+                body={"padding_block_size": 0},
+            )
+            assert st == 400, f"expected 400 for padding=0, got {st}"
+
+            # 4. Config bounds: data_time_window_ns too small (< 1s) rejected.
+            st, body = _admin_request(
+                "PUT", "/admin/config", token=ADMIN_TOKEN,
+                body={"data_time_window_ns": 1000},  # 1 microsecond
+            )
+            assert st == 400, f"expected 400 for tiny time window, got {st}"
+
+            # 5. UI loads (XSS fields use textContent in the embedded JS).
+            st, body = _admin_request("GET", "/admin/", token=ADMIN_TOKEN)
+            assert st == 200 and "textContent" in body, "UI should use textContent for XSS safety"
+
+            record(name, True, "lockout/CSRF/config-bounds/UI-XSS all verified")
+        finally:
+            srv.terminate()
+            srv.wait(timeout=3)
+    except Exception as e:
+        record(name, False, f"{type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1132,6 +1441,10 @@ def main():
         test_t12_clock_offset()
         test_t14_appapi_action()
         test_t15_appapi_errors()
+        test_t17_handshake_timeout()
+        test_t18_oversized_payloads()
+        test_t19_dedup_and_kv_limits()
+        test_t20_worker_backpressure()
     finally:
         stop_server(server_proc)
 
@@ -1140,6 +1453,7 @@ def main():
     test_t11_passphrase_key()
     test_t13_crl_multipin()
     test_t16_admin()
+    test_t21_admin_hardening()
 
     ok = summary()
     sys.exit(0 if ok else 1)

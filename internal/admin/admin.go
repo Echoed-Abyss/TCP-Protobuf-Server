@@ -21,10 +21,38 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/protocol"
 )
+
+// Auth rate-limit thresholds. After MaxAuthFailures failures from the same
+// source IP, that IP is locked out for LockoutDuration. This slows brute-
+// force token guessing.
+const (
+	MaxAuthFailures = 5
+	LockoutDuration = 30 * time.Second
+)
+
+// authRecord tracks failed authentication attempts from a single source IP.
+type authRecord struct {
+	failures  int
+	lockedAt  time.Time
+}
+
+// Server is the admin HTTP server.
+type Server struct {
+	token    string
+	bind     string
+	cm       ConnManager
+	static   StaticConfig
+	healthFn func() error // optional additional health check
+
+	// authMu protects authFailures.
+	authMu       sync.Mutex
+	authFailures map[string]*authRecord // source IP -> failure record
+}
 
 // ConnManager is the interface the admin server uses to inspect and close
 // active connections. It is satisfied by *server.Server. Defining it here
@@ -45,15 +73,6 @@ type StaticConfig struct {
 	ProtocolVer  uint8  `json:"protocol_version"`
 }
 
-// Server is the admin HTTP server.
-type Server struct {
-	token    string
-	bind     string
-	cm       ConnManager
-	static   StaticConfig
-	healthFn func() error // optional additional health check
-}
-
 // New creates an admin server. The token is loaded from the SECPROTO_ADMIN_TOKEN
 // environment variable if token is empty. It returns an error if no token is
 // available (fail-closed: an admin endpoint without auth is not allowed).
@@ -71,10 +90,11 @@ func New(bind, token string, cm ConnManager, static StaticConfig) (*Server, erro
 		return nil, err
 	}
 	return &Server{
-		token:  token,
-		bind:   bind,
-		cm:     cm,
-		static: static,
+		token:        token,
+		bind:         bind,
+		cm:           cm,
+		static:       static,
+		authFailures: make(map[string]*authRecord),
 	}, nil
 }
 
@@ -126,17 +146,103 @@ func (s *Server) ListenAndServe() error {
 	return srv.ListenAndServe()
 }
 
-// requireAuth is a middleware that enforces bearer-token authentication.
-// The token is compared in constant time. The token value is never logged.
+// requireAuth enforces bearer-token authentication with per-IP rate
+// limiting (lockout after repeated failures) plus a custom-header CSRF
+// check for state-changing requests. The token is compared in constant
+// time. The token value is never logged.
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ip := sourceIP(r)
+
+		// 1. Lockout check: if this IP is in a lockout window, reject
+		//    immediately without comparing the token.
+		if s.isLockedOut(ip) {
+			protocol.GlobalMetrics.AdminRateLimited.Add(1)
+			http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
+			return
+		}
+
+		// 2. Token check (constant-time comparison).
 		got := extractToken(r)
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) != 1 {
+		authed := subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
+		if !authed {
+			protocol.GlobalMetrics.AdminAuthFail.Add(1)
+			s.recordAuthResult(ip, false)
+			// Constant artificial delay on auth failure to reduce timing
+			// side-channels that could distinguish wrong-token from
+			// lockout. 5ms is small enough not to enable DoS amplification
+			// but large enough to dominate comparison timing.
+			time.Sleep(5 * time.Millisecond)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		s.recordAuthResult(ip, true)
+
+		// 3. CSRF defence for state-changing methods: require a custom
+		//    header that browsers will not send on cross-origin requests
+		//    without CORS preflight (which the admin server does not
+		//    allow). Simple <form> submissions cannot set custom headers.
+		if r.Method == http.MethodPut || r.Method == http.MethodPost || r.Method == http.MethodDelete {
+			if r.Header.Get("X-Admin-Action") == "" {
+				protocol.GlobalMetrics.AdminAuthFail.Add(1)
+				http.Error(w, "missing X-Admin-Action header", http.StatusForbidden)
+				return
+			}
+		}
+
 		next(w, r)
 	}
+}
+
+// sourceIP extracts the client IP from a request's RemoteAddr.
+func sourceIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// isLockedOut reports whether the source IP is currently locked out due to
+// too many failed auth attempts.
+func (s *Server) isLockedOut(ip string) bool {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	rec, ok := s.authFailures[ip]
+	if !ok {
+		return false
+	}
+	if rec.failures >= MaxAuthFailures {
+		if time.Since(rec.lockedAt) < LockoutDuration {
+			return true
+		}
+		rec.failures = 0 // lockout expired
+	}
+	return false
+}
+
+// recordAuthResult updates the failure counter for an IP.
+func (s *Server) recordAuthResult(ip string, ok bool) {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	rec, exists := s.authFailures[ip]
+	if !exists {
+		rec = &authRecord{}
+		s.authFailures[ip] = rec
+	}
+	if ok {
+		rec.failures = 0
+	} else {
+		rec.failures++
+		rec.lockedAt = time.Now()
+	}
+}
+
+// audit writes an audit log entry for admin state-changing operations.
+// The message must never contain tokens, keys, or sensitive payloads.
+func (s *Server) audit(action, detail string) {
+	fmt.Fprintf(os.Stderr, "[admin-audit] time=%s action=%s detail=%s\n",
+		time.Now().UTC().Format(time.RFC3339), action, detail)
 }
 
 // extractToken reads the token from the Authorization header
@@ -215,17 +321,40 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		var u protocol.HotConfigUpdate
 		if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
+			protocol.GlobalMetrics.AdminConfigReject.Add(1)
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"ok": "false", "code": "bad_request", "error": "invalid json",
 			})
 			return
 		}
 		if err := protocol.GlobalConfig.Apply(u); err != nil {
+			protocol.GlobalMetrics.AdminConfigReject.Add(1)
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"ok": "false", "code": "bad_request", "error": err.Error(),
 			})
 			return
 		}
+		// Audit: log which fields were changed, never their values.
+		var changed []string
+		if u.HeartbeatIntervalNs != nil {
+			changed = append(changed, "heartbeat_interval_ns")
+		}
+		if u.DummyFrameIntervalNs != nil {
+			changed = append(changed, "dummy_frame_interval_ns")
+		}
+		if u.DummyFrameJitterNs != nil {
+			changed = append(changed, "dummy_frame_jitter_ns")
+		}
+		if u.DummyFramesEnabled != nil {
+			changed = append(changed, "dummy_frames_enabled")
+		}
+		if u.PaddingBlockSize != nil {
+			changed = append(changed, "padding_block_size")
+		}
+		if u.DataTimeWindowNs != nil {
+			changed = append(changed, "data_time_window_ns")
+		}
+		s.audit("config.update", "fields="+strings.Join(changed, ","))
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "code": "ok", "hot": protocol.GlobalConfig.Snapshot(),
 		})
@@ -273,8 +402,8 @@ func (s *Server) handleConnectionOp(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "connection not found", http.StatusNotFound)
 		return
 	}
-	// Audit log (no secrets).
-	fmt.Printf("[admin] connection %d closed by admin\n", id)
+	// Audit log (no secrets: only the conn id, which is a local counter).
+	s.audit("connection.close", fmt.Sprintf("conn_id=%d", id))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id})
 }
 

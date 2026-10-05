@@ -20,6 +20,10 @@ var DefaultCipherSuites = []protocol.CipherSuite{
 
 // Handshake runs the handshake. The role (client/server) is determined by
 // the isClient flag set at construction.
+//
+// A handshake deadline of HandshakeTimeout is enforced: if the handshake
+// does not complete in time, the connection is torn down. This prevents
+// half-open connections from holding resources indefinitely.
 func (c *Conn) Handshake() error {
 	c.handshakeMu.Lock()
 	defer c.handshakeMu.Unlock()
@@ -27,16 +31,28 @@ func (c *Conn) Handshake() error {
 		return nil
 	}
 
+	// Enforce handshake deadline on the underlying connection. All
+	// readFrame calls during the handshake respect this deadline.
+	deadline := time.Now().Add(time.Duration(protocol.HandshakeTimeout))
+	_ = c.raw.SetReadDeadline(deadline)
+
+	var err error
 	if c.isClient {
-		if err := c.clientHandshake(); err != nil {
-			c.Close()
-			return c.fail(err)
-		}
+		err = c.clientHandshake()
 	} else {
-		if err := c.serverHandshake(); err != nil {
-			c.Close()
-			return c.fail(err)
+		err = c.serverHandshake()
+	}
+
+	// Clear the handshake deadline; the normal readTimeout takes over for
+	// the data phase.
+	_ = c.raw.SetReadDeadline(time.Time{})
+
+	if err != nil {
+		if isTimeoutErr(err) {
+			protocol.GlobalMetrics.HandshakeTimeout.Add(1)
 		}
+		c.Close()
+		return c.fail(err)
 	}
 
 	c.handshakeDone = true
@@ -44,6 +60,18 @@ func (c *Conn) Handshake() error {
 	protocol.GlobalMetrics.HandshakeOK.Add(1)
 	c.startHeartbeat()
 	return nil
+}
+
+// isTimeoutErr reports whether err is a network read timeout.
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	type timeout interface{ Timeout() bool }
+	if t, ok := err.(timeout); ok {
+		return t.Timeout()
+	}
+	return false
 }
 
 // ---------- Client handshake ----------

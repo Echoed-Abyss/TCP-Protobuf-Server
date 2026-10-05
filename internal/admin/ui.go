@@ -51,8 +51,18 @@ const uiHTML = `<!DOCTYPE html>
 </div>
 <script>
 const TOKEN = prompt("请输入 admin token") || "";
-const H = {"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"};
-async function get(p){const r=await fetch(p,{headers:H});return r.json()}
+// Write requests require the X-Admin-Action custom header as a CSRF
+// defence (browsers cannot set custom headers on cross-origin requests
+// without a CORS preflight, which this server does not allow).
+const H = {"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json","X-Admin-Action":"1"};
+const H_READ = {"Authorization":"Bearer "+TOKEN};
+
+// Escape HTML-special characters so controllable strings (peer fingerprint,
+// remote address) cannot inject markup. textContent is preferred for
+// inserting text; this is a fallback for cases where markup is required.
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+
+async function get(p){const r=await fetch(p,{headers:H_READ});return r.json()}
 async function refresh(){
   try{
     const s=await get("/admin/stats");
@@ -64,16 +74,31 @@ async function refresh(){
       ["过期包",m.expired_rejected],["重协商",m.renegotiations],
       ["Dummy帧",m.dummy_frames_sent],["帧数(发/收)",(m.frames_sent||0)+"/"+(m.frames_received||0)]
     ];
-    document.getElementById("stats").innerHTML=items.map(([l,n])=>
-      '<div class="stat"><div class="n">'+n+'</div><div class="l">'+l+'</div></div>').join("");
+    // Use textContent to prevent XSS from numeric/string values.
+    const host=document.getElementById("stats");
+    host.textContent="";
+    for(const [l,n] of items){
+      const d=document.createElement("div");d.className="stat";
+      const nn=document.createElement("div");nn.className="n";nn.textContent=n;
+      const ll=document.createElement("div");ll.className="l";ll.textContent=l;
+      d.appendChild(nn);d.appendChild(ll);host.appendChild(d);
+    }
     const c=await get("/admin/config");
     const f=document.forms.cfgform;
     for(const k in c.hot){const el=f.elements[k];if(el)el.value=c.hot[k]}
     const cs=await get("/admin/connections");
-    document.querySelector("#conns tbody").innerHTML=cs.map(c=>
-      '<tr><td>'+c.id+'</td><td>'+c.peer_fingerprint+'</td><td>'+c.remote_addr+
-      '</td><td>'+c.key_id+'</td><td>'+c.bytes_sent+'/'+c.bytes_recv+
-      '</td><td><button onclick="closeConn('+c.id+')">断开</button></td></tr>').join("");
+    const tb=document.querySelector("#conns tbody");
+    tb.textContent="";
+    for(const c of cs){
+      const tr=document.createElement("tr");
+      const cells=[String(c.id),esc(c.peer_fingerprint),esc(c.remote_addr),
+        String(c.key_id),c.bytes_sent+"/"+c.bytes_recv];
+      for(const v of cells){const td=document.createElement("td");td.textContent=v;tr.appendChild(td)}
+      const td=document.createElement("td");
+      const b=document.createElement("button");b.textContent="断开";
+      b.onclick=()=>closeConn(c.id);td.appendChild(b);tr.appendChild(td);
+      tb.appendChild(tr);
+    }
   }catch(e){console.error(e)}
 }
 document.forms.cfgform.addEventListener("submit",async e=>{

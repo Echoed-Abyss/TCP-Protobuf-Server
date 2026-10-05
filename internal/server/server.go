@@ -23,6 +23,10 @@ type Server struct {
 	// active tracks handshaken connections keyed by connID.
 	active   map[uint64]*transport.Conn
 	activeMu sync.Mutex
+
+	// gate enforces per-IP connection count and rate limits before the
+	// handshake runs, preventing unauthenticated resource exhaustion.
+	gate *connGate
 }
 
 // NewServer creates a server that will listen on addr.
@@ -31,7 +35,15 @@ func NewServer(identity *crypto.IdentityKey) *Server {
 		identity: identity,
 		logger:   protocol.NewSensitiveLogger("[server] "),
 		active:   make(map[uint64]*transport.Conn),
+		gate:     newConnGate(DefaultMaxConnsPerIP, DefaultConnRatePerSec),
 	}
+}
+
+// SetConnLimits configures the per-IP connection gate. maxConns is the
+// maximum simultaneous connections per IP; ratePerSec is the maximum new
+// connections per second per IP. Values <= 0 use defaults.
+func (s *Server) SetConnLimits(maxConns, ratePerSec int) {
+	s.gate = newConnGate(maxConns, ratePerSec)
 }
 
 // SetTrustStore enables TOFU / pinned-key verification for incoming clients.
@@ -66,6 +78,15 @@ func (s *Server) Serve() error {
 }
 
 func (s *Server) handleConn(raw net.Conn) {
+	// Per-IP connection + rate gate. Fail-closed: rejected connections are
+	// closed immediately before any handshake work is done.
+	release, ok := s.gate.Admit(raw.RemoteAddr())
+	if !ok {
+		_ = raw.Close()
+		return
+	}
+	defer release()
+
 	c := transport.NewConn(raw, s.identity, false)
 	defer func() {
 		s.activeMu.Lock()

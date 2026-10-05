@@ -19,10 +19,11 @@
 package appapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -115,6 +116,16 @@ const (
 	DefaultMaxWorkers   = 64
 	DefaultMaxTimeoutMs = 30_000 // 30s cap on any single request
 	DefaultDedupSize    = 1024
+
+	// HardHandlerTimeoutMs is the absolute wall-clock ceiling for any
+	// handler execution, independent of (and always <=) the request's
+	// timeout_ms. A handler that ignores ctx.Done() and runs forever is
+	// still killed at this limit.
+	HardHandlerTimeoutMs = 5_000 // 5s
+
+	// MaxKVEntries caps the number of key/value pairs the demo kv store
+	// holds. Beyond this, oldest entries are evicted (LRU).
+	MaxKVEntries = 1024
 )
 
 // Server serves application requests over a transport.Conn.
@@ -127,8 +138,10 @@ type Server struct {
 	// handler goroutines across all connections sharing this server.
 	workers chan struct{}
 
-	// kv is the shared key/value store for the kv.set/kv.get demo handlers.
-	kv sync.Map
+	// kv is a bounded key/value store for the kv.set/kv.get demo handlers.
+	// It is shared across connections and capped at MaxKVEntries (LRU
+	// eviction) so a flood of kv.set cannot exhaust memory.
+	kv *boundedKV
 
 	// dedupSize is the per-connection dedup cache capacity.
 	dedupSize int
@@ -145,6 +158,7 @@ func NewServer(registry *Registry, maxWorkers int) *Server {
 		maxWorkers: maxWorkers,
 		maxTimeout: time.Duration(DefaultMaxTimeoutMs) * time.Millisecond,
 		workers:    make(chan struct{}, maxWorkers),
+		kv:         newBoundedKV(MaxKVEntries),
 		dedupSize:  DefaultDedupSize,
 	}
 }
@@ -174,14 +188,22 @@ func (s *Server) ServeConn(conn *transport.Conn) error {
 	return err
 }
 
-// dispatch offloads a request to the bounded worker pool. It returns
-// immediately so the read loop is never blocked by a slow handler.
+// dispatch offloads a request to the bounded worker pool. If the pool is
+// saturated, it returns a too_many_requests response immediately (no
+// unbounded queueing) so the read loop is never blocked.
 func (s *Server) dispatch(conn *transport.Conn, data []byte, state *connState) {
 	state.wg.Add(1)
 	go func() {
 		defer state.wg.Done()
-		// Acquire a worker slot (blocks here, not in the read loop).
-		s.workers <- struct{}{}
+		// Non-blocking worker acquisition: if the pool is full, reject
+		// fast rather than queueing unbounded requests.
+		select {
+		case s.workers <- struct{}{}:
+		default:
+			protocol.GlobalMetrics.AppWorkerReject.Add(1)
+			s.sendResp(conn, errResp("", CodeTooManyReqs, "server busy"))
+			return
+		}
 		defer func() { <-s.workers }()
 		s.process(conn, data, state)
 	}()
@@ -199,9 +221,20 @@ func (s *Server) process(conn *transport.Conn, data []byte, state *connState) {
 		return
 	}
 
+	// Hard limit on decrypted application payload size BEFORE parsing.
+	if len(data) > protocol.MaxAppPayload {
+		protocol.GlobalMetrics.AppPayloadReject.Add(1)
+		s.sendResp(conn, errResp("", CodeBadRequest, "payload too large"))
+		return
+	}
+
 	resp := s.handle(data, state)
-	// Re-serialize and send. Errors here (e.g. conn closed) are ignored:
-	// the read loop will surface them.
+	s.sendResp(conn, resp)
+}
+
+// sendResp marshals and sends a response, ignoring send errors (the read
+// loop surfaces connection failures).
+func (s *Server) sendResp(conn *transport.Conn, resp *Response) {
 	if conn == nil {
 		return
 	}
@@ -214,6 +247,13 @@ func (s *Server) process(conn *transport.Conn, data []byte, state *connState) {
 
 // handle is the pure request-handling logic (no I/O), making it testable.
 func (s *Server) handle(data []byte, state *connState) *Response {
+	// Enforce JSON nesting depth before full unmarshal to prevent
+	// stack/CPU exhaustion from deeply nested payloads.
+	if err := checkJSONDepth(data, protocol.MaxJSONDepth); err != nil {
+		protocol.GlobalMetrics.AppPayloadReject.Add(1)
+		return errResp("", CodeBadRequest, "malformed request")
+	}
+
 	var req Request
 	if err := json.Unmarshal(data, &req); err != nil {
 		return errResp("", CodeBadRequest, "malformed request")
@@ -223,6 +263,12 @@ func (s *Server) handle(data []byte, state *connState) *Response {
 	}
 	if req.ReqID == "" || req.Action == "" {
 		return errResp(req.ReqID, CodeBadRequest, "missing required fields")
+	}
+	// req_id must be short and use a safe charset to prevent cache-key
+	// abuse and log injection.
+	if !validReqID(req.ReqID) {
+		protocol.GlobalMetrics.AppReqIDReject.Add(1)
+		return errResp("", CodeBadRequest, "invalid req_id")
 	}
 
 	// Idempotency: if this req_id was recently processed on this connection,
@@ -239,7 +285,8 @@ func (s *Server) handle(data []byte, state *connState) *Response {
 		return resp
 	}
 
-	// Per-request timeout, bounded by maxTimeout.
+	// Per-request timeout, bounded by both maxTimeout and the hard
+	// handler ceiling. A handler that ignores ctx cannot run forever.
 	timeout := s.maxTimeout
 	if req.TimeoutMs > 0 {
 		t := time.Duration(req.TimeoutMs) * time.Millisecond
@@ -247,11 +294,22 @@ func (s *Server) handle(data []byte, state *connState) *Response {
 			timeout = t
 		}
 	}
+	if hardLimit := time.Duration(HardHandlerTimeoutMs) * time.Millisecond; timeout > hardLimit {
+		timeout = hardLimit
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	done := make(chan *Response, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Handler panicked: never leak the panic value/stack to
+				// the client. Return a generic internal error.
+				protocol.GlobalMetrics.AppPanicRecovered.Add(1)
+				done <- errResp(req.ReqID, CodeInternal, "handler error")
+			}
+		}()
 		resp, err := h(ctx, &req)
 		if err != nil {
 			// Never leak the internal error text.
@@ -276,6 +334,57 @@ func (s *Server) handle(data []byte, state *connState) *Response {
 		return resp
 	}
 }
+
+// validReqID reports whether id is a safe req_id: length <= MaxReqIDLen and
+// only [A-Za-z0-9._-]. This prevents cache-key collisions, log injection,
+// and oversized-key memory pressure.
+func validReqID(id string) bool {
+	if len(id) == 0 || len(id) > protocol.MaxReqIDLen {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !(c >= 'a' && c <= 'z') &&
+			!(c >= 'A' && c <= 'Z') &&
+			!(c >= '0' && c <= '9') &&
+			c != '.' && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// checkJSONDepth walks the JSON tokens in data and returns an error if the
+// nesting depth exceeds maxDepth. It rejects malformed JSON too (the caller
+// then reports a generic bad_request). Using json.Decoder.Token is
+// streaming and does not materialise the full object tree.
+func checkJSONDepth(data []byte, maxDepth int) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	depth := 0
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		switch tok.(type) {
+		case json.Delim:
+			d := tok.(json.Delim)
+			if d == '{' || d == '[' {
+				depth++
+				if depth > maxDepth {
+					return errDepthExceeded
+				}
+			} else if d == '}' || d == ']' {
+				depth--
+			}
+		}
+	}
+}
+
+var errDepthExceeded = errors.New("json nesting depth exceeded")
 
 // errResp builds a non-OK response with a generic error message.
 func errResp(reqID, code, msg string) *Response {
@@ -380,7 +489,13 @@ type kvRequestPayload struct {
 	Value string `json:"value,omitempty"`
 }
 
-// KVSetHandler stores a key/value pair.
+// Bounds for kv demo store keys/values to prevent memory abuse.
+const (
+	maxKVKeyLen   = 256
+	maxKVValueLen = 4096
+)
+
+// KVSetHandler stores a key/value pair. Keys and values are length-bounded.
 func (s *Server) KVSetHandler(ctx context.Context, req *Request) (*Response, error) {
 	select {
 	case <-ctx.Done():
@@ -391,10 +506,13 @@ func (s *Server) KVSetHandler(ctx context.Context, req *Request) (*Response, err
 	if err := json.Unmarshal(req.Payload, &p); err != nil {
 		return errResp(req.ReqID, CodeBadRequest, "invalid payload"), nil
 	}
-	if p.Key == "" {
-		return errResp(req.ReqID, CodeBadRequest, "missing key"), nil
+	if p.Key == "" || len(p.Key) > maxKVKeyLen {
+		return errResp(req.ReqID, CodeBadRequest, "invalid key"), nil
 	}
-	s.kv.Store(p.Key, p.Value)
+	if len(p.Value) > maxKVValueLen {
+		return errResp(req.ReqID, CodeBadRequest, "value too large"), nil
+	}
+	s.kv.set(p.Key, p.Value)
 	return okResp(req.ReqID, json.RawMessage(`{"stored":true}`)), nil
 }
 
@@ -409,11 +527,11 @@ func (s *Server) KVGetHandler(ctx context.Context, req *Request) (*Response, err
 	if err := json.Unmarshal(req.Payload, &p); err != nil {
 		return errResp(req.ReqID, CodeBadRequest, "invalid payload"), nil
 	}
-	v, ok := s.kv.Load(p.Key)
+	v, ok := s.kv.get(p.Key)
 	if !ok {
 		return okResp(req.ReqID, json.RawMessage(`{"found":false}`)), nil
 	}
-	b, _ := json.Marshal(map[string]any{"found": true, "value": fmt.Sprint(v)})
+	b, _ := json.Marshal(map[string]any{"found": true, "value": v})
 	return okResp(req.ReqID, b), nil
 }
 
@@ -425,7 +543,52 @@ func (s *Server) RegisterDefaults() {
 	s.registry.Register("kv.get", s.KVGetHandler)
 }
 
+// ---------------------------------------------------------------------------
+// boundedKV: a small LRU key/value store with a hard capacity cap.
+// Used by the kv.set/kv.get demo handlers so a flood of sets cannot
+// exhaust memory.
+// ---------------------------------------------------------------------------
+
+type boundedKV struct {
+	mu     sync.Mutex
+	cap    int
+	items  map[string]string
+	order  []string // insertion order for LRU eviction
+}
+
+func newBoundedKV(cap int) *boundedKV {
+	if cap <= 0 {
+		cap = MaxKVEntries
+	}
+	return &boundedKV{
+		cap:   cap,
+		items: make(map[string]string),
+	}
+}
+
+func (k *boundedKV) set(key, value string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if _, exists := k.items[key]; exists {
+		k.items[key] = value
+		return
+	}
+	if len(k.items) >= k.cap {
+		// Evict oldest (LRU).
+		oldest := k.order[0]
+		k.order = k.order[1:]
+		delete(k.items, oldest)
+	}
+	k.items[key] = value
+	k.order = append(k.order, key)
+}
+
+func (k *boundedKV) get(key string) (string, bool) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	v, ok := k.items[key]
+	return v, ok
+}
+
 // errRequestTooLarge is returned when a request payload exceeds the limit.
-// (Currently the transport enforces MaxFramePayload; this is a placeholder
-// for future application-level limits.)
 var errRequestTooLarge = errors.New("request too large")

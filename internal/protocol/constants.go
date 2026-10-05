@@ -69,8 +69,33 @@ const (
 )
 
 // MaxFramePayload is the maximum allowed payload length per frame.
-// 16 MiB is a generous upper bound; anything larger is treated as an attack.
-const MaxFramePayload = 16 * 1024 * 1024
+// 64 KiB is a tight upper bound: handshake messages and application data
+// fit comfortably, and it prevents memory-amplification attacks where an
+// attacker sends a huge Length field to force the receiver to allocate
+// large buffers. Anything larger is rejected and the connection is torn
+// down.
+const MaxFramePayload = 64 * 1024
+
+// MaxAppPayload is the maximum size of a decrypted application-layer
+// (appapi) JSON payload, in bytes. This is independent of MaxFramePayload
+// so that even a valid frame cannot carry an oversized appapi message.
+const MaxAppPayload = 32 * 1024
+
+// HandshakeTimeout is the maximum time allowed for the handshake to
+// complete (from TCP accept to ServerFinished). Connections that exceed
+// this are torn down to prevent half-open connection resource exhaustion.
+const HandshakeTimeout int64 = 10 * 1e9 // 10 seconds
+
+// MaxReqIDLen is the maximum length of an appapi req_id string.
+const MaxReqIDLen = 128
+
+// MaxJSONDepth is the maximum nesting depth allowed when decoding appapi
+// JSON payloads. Deeply nested JSON can cause stack exhaustion.
+const MaxJSONDepth = 32
+
+// MaxJSONArrayLen is the maximum number of elements in a top-level JSON
+// array within an appapi payload.
+const MaxJSONArrayLen = 4096
 
 // HandshakeTimeWindow is the maximum allowed clock skew for handshake
 // messages (nanoseconds). Frames outside this window are rejected.

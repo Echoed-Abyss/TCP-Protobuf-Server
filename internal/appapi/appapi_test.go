@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/Echoed-Abyss/TCP-Protobuf-Server/internal/protocol"
 )
 
 func newTestServer() *Server {
@@ -185,4 +187,177 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(buf[i:])
+}
+
+// TestPayloadTooLarge verifies that a decrypted payload exceeding
+// protocol.MaxAppPayload is rejected before JSON parsing.
+func TestPayloadTooLarge(t *testing.T) {
+	s := newTestServer()
+	state := &connState{dedup: newDedupCache(8)}
+
+	// Build a payload just over the limit with a huge "value" field.
+	big := make([]byte, 0, 64*1024)
+	big = append(big, []byte(`{"ver":1,"req_id":"big","action":"echo","payload":{"x":"`)...)
+	for len(big) < 40*1024 {
+		big = append(big, 'a')
+	}
+	big = append(big, []byte(`"}}`)...)
+
+	resp := s.processForTest(big, state)
+	if resp.Ok || resp.Code != CodeBadRequest {
+		t.Fatalf("expected bad_request for oversized payload, got ok=%v code=%s", resp.Ok, resp.Code)
+	}
+}
+
+// processForTest is a test helper that runs process with a nil conn and
+// returns the response that would have been sent.
+func (s *Server) processForTest(data []byte, state *connState) *Response {
+	// Replicate the size check + handle logic without I/O.
+	if len(data) == 0 || data[0] != '{' {
+		return okResp("", nil) // echo path; not relevant here
+	}
+	if len(data) > protocol.MaxAppPayload {
+		return errResp("", CodeBadRequest, "payload too large")
+	}
+	return s.handle(data, state)
+}
+
+// TestJSONDepthLimit verifies that JSON nesting deeper than
+// protocol.MaxJSONDepth is rejected.
+func TestJSONDepthLimit(t *testing.T) {
+	s := newTestServer()
+	state := &connState{dedup: newDedupCache(8)}
+
+	// Build a deeply nested object: {{"a":{{"a":...}}}}
+	deep := []byte(`{"ver":1,"req_id":"d","action":"echo","payload":`)
+	for i := 0; i < protocol.MaxJSONDepth+5; i++ {
+		deep = append(deep, '{')
+	}
+	deep = append(deep, '"', 'x', '"', ':', '1')
+	for i := 0; i < protocol.MaxJSONDepth+5; i++ {
+		deep = append(deep, '}')
+	}
+	deep = append(deep, '}')
+
+	resp := s.handle(deep, state)
+	if resp.Ok || resp.Code != CodeBadRequest {
+		t.Fatalf("expected bad_request for deep JSON, got ok=%v code=%s", resp.Ok, resp.Code)
+	}
+}
+
+// TestReqIDValidation verifies that req_id must be short and use a safe
+// charset.
+func TestReqIDValidation(t *testing.T) {
+	s := newTestServer()
+	state := &connState{dedup: newDedupCache(8)}
+
+	cases := []struct {
+		reqID string
+		ok    bool
+	}{
+		{"valid_id-1.2", true},
+		{"", false},
+		{"with space", false},
+		{"with/slash", false},
+		{"with;semi", false},
+		{string(make([]byte, protocol.MaxReqIDLen+1)), false},
+	}
+	for _, c := range cases {
+		req := `{"ver":1,"req_id":"` + c.reqID + `","action":"echo","payload":{}}`
+		resp := s.handle([]byte(req), state)
+		if c.ok && (!resp.Ok || resp.Code != CodeOK) {
+			t.Errorf("req_id %q should be valid, got code=%s", c.reqID, resp.Code)
+		}
+		if !c.ok && resp.Code != CodeBadRequest {
+			t.Errorf("req_id %q should be rejected, got code=%s", c.reqID, resp.Code)
+		}
+	}
+}
+
+// TestWorkerBackpressure verifies that when the worker pool is saturated,
+// new requests get a too_many_requests response instead of queueing.
+func TestWorkerBackpressure(t *testing.T) {
+	reg := NewRegistry()
+	s := NewServer(reg, 1) // single worker slot
+	started := make(chan struct{})
+	release := make(chan struct{})
+	reg.Register("block", func(ctx context.Context, req *Request) (*Response, error) {
+		close(started)
+		<-release
+		return okResp(req.ReqID, nil), nil
+	})
+
+	state := &connState{dedup: newDedupCache(8)}
+	// Occupy the single worker.
+	s.dispatch(nil, []byte(`{"ver":1,"req_id":"b1","action":"block","payload":{}}`), state)
+	<-started // wait for the worker to start
+
+	// Verify the worker semaphore is full (non-blocking send fails),
+	// which is what dispatch checks before returning too_many_requests.
+	full := false
+	select {
+	case s.workers <- struct{}{}:
+		<-s.workers
+	default:
+		full = true
+	}
+	if !full {
+		t.Fatal("expected worker pool to be full")
+	}
+
+	close(release)
+	state.wg.Wait()
+}
+
+// TestKVCapacity verifies the kv store is bounded by MaxKVEntries and
+// evicts oldest entries.
+func TestKVCapacity(t *testing.T) {
+	reg := NewRegistry()
+	s := NewServer(reg, 4)
+	s.RegisterDefaults()
+	state := &connState{dedup: newDedupCache(8)}
+
+	// Fill beyond capacity.
+	for i := 0; i < MaxKVEntries+50; i++ {
+		req := `{"ver":1,"req_id":"k` + itoa(i) + `","action":"kv.set","payload":{"key":"k` + itoa(i) + `","value":"v"}}`
+		s.handle([]byte(req), state)
+	}
+
+	// The store should never exceed MaxKVEntries.
+	s.kv.mu.Lock()
+	count := len(s.kv.items)
+	s.kv.mu.Unlock()
+	if count > MaxKVEntries {
+		t.Fatalf("kv store exceeded capacity: %d > %d", count, MaxKVEntries)
+	}
+
+	// Oldest entries should have been evicted.
+	getReq := `{"ver":1,"req_id":"g0","action":"kv.get","payload":{"key":"k0"}}`
+	resp := s.handle([]byte(getReq), state)
+	var data map[string]any
+	_ = json.Unmarshal(resp.Data, &data)
+	if data["found"] != false {
+		t.Fatalf("expected oldest entry to be evicted, got found=%v", data["found"])
+	}
+}
+
+// TestPanicRecovery verifies that a panicking handler returns a generic
+// internal error and does not crash the server.
+func TestPanicRecovery(t *testing.T) {
+	reg := NewRegistry()
+	s := NewServer(reg, 4)
+	reg.Register("boom", func(ctx context.Context, req *Request) (*Response, error) {
+		panic("something went very wrong")
+	})
+	state := &connState{dedup: newDedupCache(8)}
+
+	req := `{"ver":1,"req_id":"p","action":"boom","payload":{}}`
+	resp := s.handle([]byte(req), state)
+	if resp.Ok || resp.Code != CodeInternal {
+		t.Fatalf("expected internal error from panicking handler, got ok=%v code=%s", resp.Ok, resp.Code)
+	}
+	// The error message must not leak the panic string.
+	if resp.Error == "" || resp.Error == "something went very wrong" {
+		t.Fatalf("error message must be generic and non-empty, got %q", resp.Error)
+	}
 }

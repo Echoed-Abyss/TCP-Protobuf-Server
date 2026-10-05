@@ -124,13 +124,23 @@ func (c *RuntimeConfig) Apply(u HotConfigUpdate) error {
 		}
 	}
 	if u.PaddingBlockSize != nil {
-		if *u.PaddingBlockSize < 0 || *u.PaddingBlockSize > 1024 {
-			return errConfig("padding_block_size must be in [0, 1024]")
+		// Min 1: padding MUST be applied (0 would disable traffic-analysis
+		// protection). Max 1024 keeps per-frame overhead bounded.
+		if *u.PaddingBlockSize < 1 || *u.PaddingBlockSize > 1024 {
+			return errConfig("padding_block_size must be in [1, 1024]")
 		}
 	}
 	if u.DataTimeWindowNs != nil {
+		// Min 1s: a window of 0 would disable timestamp replay protection.
 		if *u.DataTimeWindowNs < 1e9 || *u.DataTimeWindowNs > 3600*1e9 {
 			return errConfig("data_time_window_ns must be in [1s, 1h]")
+		}
+	}
+	// Cross-field check: jitter must not exceed the dummy frame interval,
+	// otherwise the dummy sender could compute a negative sleep duration.
+	if u.DummyFrameJitterNs != nil && u.DummyFrameIntervalNs != nil {
+		if *u.DummyFrameJitterNs > *u.DummyFrameIntervalNs {
+			return errConfig("dummy_frame_jitter_ns must not exceed dummy_frame_interval_ns")
 		}
 	}
 
